@@ -32,6 +32,7 @@ set(files
 	src/moonem_common.c
 	src/moonem_sw.cpp
 	src/moonem.cpp
+	src/ipsec-sw.c
 )
 
 set(libraries
