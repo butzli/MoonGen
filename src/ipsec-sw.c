@@ -32,13 +32,14 @@ struct mg_ipsec_sa {
 	uint8_t hdr[MG_IPSEC_ETH_LEN + sizeof(struct rte_ipv4_hdr)];
 	int outbound;
 	int tunnel;
+	uint32_t first_seq;            // ESP sequence number of the first/last packet received for this SA
+	uint32_t last_seq;
+	uint64_t seen;                 // packets received for this SA (before replay check and decryption)
 };
 
 struct mg_ipsec_rx_stats {
 	uint64_t rx_pkts;       // all received frames
-	uint64_t rx_bytes;      // all received frames, bytes on the wire (without CRC/preamble)
 	uint64_t ok_pkts;       // successfully decrypted and authenticated
-	uint64_t inner_bytes;   // bytes of the decrypted inner packets (without L2)
 	uint64_t non_esp;       // not IPv4/ESP
 	uint64_t unknown_spi;   // SPI outside of the configured range
 	uint64_t prepare_drops; // replay window / malformed packets (rejected before decryption)
@@ -151,7 +152,8 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 		prm.tun.hdr_l3_off = MG_IPSEC_ETH_LEN;
 		prm.tun.next_proto = IPPROTO_IPIP;
 	} else {
-		prm.trs.proto = IPPROTO_UDP;
+		// rte_ipsec expects the IP version of the protected packet here, not the L4 protocol
+		prm.trs.proto = IPPROTO_IPIP;
 	}
 
 	int size = rte_ipsec_sa_size(&prm);
@@ -240,6 +242,14 @@ uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 	return rte_ipsec_pkt_process(&s->ss, mb, k);
 }
 
+// First and last ESP sequence number received for this SA by mg_ipsec_rx_decrypt and the number of
+// packets in between; a difference means that packets of this SA were lost. Returns the number of packets seen.
+uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last) {
+	*first = s->first_seq;
+	*last = s->last_seq;
+	return s->seen;
+}
+
 // Complete receive step: rx burst, SA lookup by SPI (sas[spi - spi_base]), decrypt, count, free.
 // Returns the number of received packets.
 uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
@@ -259,7 +269,6 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 	// classify by SPI
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf* m = mb[i];
-		st->rx_bytes += m->pkt_len;
 		struct rte_ether_hdr* eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr*);
 		struct rte_ipv4_hdr* ip = (struct rte_ipv4_hdr*) (eth + 1);
 		if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) || ip->next_proto_id != IPPROTO_ESP
@@ -273,6 +282,11 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 			st->unknown_spi++;
 			continue;
 		}
+		uint32_t seq = rte_be_to_cpu_32(esph->seq);
+		if (!sas[sa_idx]->seen++) {
+			sas[sa_idx]->first_seq = seq;
+		}
+		sas[sa_idx]->last_seq = seq;
 		esp[n_esp] = m;
 		idx[n_esp] = sa_idx;
 		n_esp++;
@@ -296,11 +310,6 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		st->prepare_drops += g - prep_ok;
 		st->auth_fails += prep_ok - ok;
 		st->ok_pkts += ok;
-		// tunnel: result is the inner IP packet, transport: Ethernet + IP packet
-		uint32_t l2 = sas[cur]->tunnel ? 0 : MG_IPSEC_ETH_LEN;
-		for (uint16_t j = 0; j < ok; j++) {
-			st->inner_bytes += grp[j]->pkt_len - l2;
-		}
 	}
 	rte_pktmbuf_free_bulk(mb, n);
 	return n;

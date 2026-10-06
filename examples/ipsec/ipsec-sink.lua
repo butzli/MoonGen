@@ -1,8 +1,9 @@
 --- ESP (AES-GCM) receiver/decoder, counterpart of ipsec-gen.lua.
---- RSS spreads the packets over the RX queues by outer IP; since each SA has its own outer source IP,
---- every SA is always handled by the same core, so the anti-replay state is never shared.
+--- One rte_flow rule per SA steers SPI spiBase + i to RX queue i mod cores, so every SA is always handled
+--- by the same core (the anti-replay state is never shared) and the SAs are spread evenly over the cores.
+--- With --rss the NIC distributes by RSS hash of the outer IPs instead (uneven for few SAs).
 --- Every core decrypts, authenticates and counts the packets of its queue.
---- ./build/MoonGen --dpdk-config=examples/ipsec/dpdk-conf.lua examples/ipsec/ipsec-sink.lua <rxDev> -c 4 --sas 4
+--- ./build/MoonGen examples/ipsec/ipsec-sink.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <rxDev> -c 4 --sas 4
 local mg     = require "moongen"
 local memory = require "memory"
 local device = require "device"
@@ -10,10 +11,13 @@ local stats  = require "stats"
 local log    = require "log"
 local ipsec  = require "ipsec-sw"
 
+local SUMMARY = "received %d, decrypted+authenticated %d, auth/ICV failures %d, replay/malformed drops %d, unknown SPI %d, non-ESP %d"
+local FIELDS  = {"rx_pkts", "ok_pkts", "auth_fails", "prepare_drops", "unknown_spi", "non_esp"}
+
 function configure(parser)
 	parser:description("Receives, decrypts and verifies ESP/AES-GCM traffic from ipsec-gen.lua.")
 	parser:argument("rxDev", "Device to receive from."):convert(tonumber)
-	parser:option("-c --cores", "Number of RX cores (= RSS queues)."):default(1):convert(tonumber)
+	parser:option("-c --cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
 	parser:option("-n --sas", "Number of SAs the sender uses (= its --cores)."):default(1):convert(tonumber)
 	parser:option("-b --bits", "AES key length (128 or 256), ignored if --key is given."):default(256):convert(tonumber)
 	parser:option("-k --key", "AES-GCM key + 4 byte salt as hex (RFC 4106 layout).")
@@ -23,20 +27,23 @@ function configure(parser)
 	parser:option("--tunnel-dst", "Outer destination IP."):default("192.168.1.1")
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
+	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
+	parser:flag("--rss", "Distribute the SAs by RSS hash of the outer IPs instead of one rte_flow rule per SPI.")
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 end
 
 function master(args)
 	args.key = args.key or ipsec.testKey(args.bits)
-	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, txQueues = 1}
+	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = true}
 	device.waitForLinks()
 	ipsec.init(args.cores * args.sas + 16)
-	if args.time > 0 then
-		mg.setRuntime(args.time)
+	for i = 0, args.rss and -1 or args.sas - 1 do
+		ipsec.steerSpi(rxDev:getRxQueue(i % args.cores), args.spi_base + i)
 	end
+	if args.time > 0 then mg.setRuntime(args.time) end
 	local tasks = {}
 	for i = 0, args.cores - 1 do
-		tasks[#tasks + 1] = mg.startTask("rxSlave", rxDev:getRxQueue(i), i, args)
+		tasks[i] = mg.startTask("rxSlave", rxDev:getRxQueue(i), i, args)
 	end
 	local ctr = stats:newDevRxCounter(rxDev, "plain")
 	while mg.running() do
@@ -44,22 +51,23 @@ function master(args)
 		mg.sleepMillisIdle(10)
 	end
 	ctr:finalize()
-	local total = {}
-	for _, t in ipairs(tasks) do
-		for k, v in pairs(t:wait() or {}) do
-			total[k] = (total[k] or 0) + v
+	local total = {0, 0, 0, 0, 0, 0, 0}
+	for i = 0, args.cores - 1 do
+		for k, v in ipairs(tasks[i]:wait()) do
+			total[k] = total[k] + v
 		end
 	end
-	log:info("Total: received %d, decrypted+authenticated %d, auth/ICV failures %d, replay/malformed drops %d, unknown SPI %d, non-ESP %d",
-		total.rx_pkts or 0, total.ok_pkts or 0, total.auth_fails or 0, total.prepare_drops or 0, total.unknown_spi or 0, total.non_esp or 0)
+	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
+	local nic = rxDev:getStats()
+	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
+		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
 end
 
 function rxSlave(queue, core, args)
-	local socket = select(2, mg.getCore())
-	-- own inbound SA instances for all SPIs; only those hashed to this queue are ever used
+	-- own inbound SA instances for all SPIs; only those arriving on this queue are ever used
 	local sas = {}
 	for i = 0, args.sas - 1 do
-		sas[#sas + 1] = ipsec.createSa{
+		sas[i + 1] = ipsec.createSa{
 			dir = "in",
 			mode = args.mode,
 			spi = args.spi_base + i,
@@ -67,28 +75,31 @@ function rxSlave(queue, core, args)
 			src = parseIP4Address(args.tunnel_src) + i,
 			dst = args.tunnel_dst,
 			replayWindow = args.replay_window,
-			socket = socket,
+			socket = select(2, mg.getCore()),
 		}
 	end
 	local saTable = ipsec.createSaTable(sas)
 	local st = ipsec.newRxStats()
 	local bufs = memory.bufArray(args.burst)
-	local ctr = stats:newManualRxCounter(("Queue %d decrypted"):format(core), "plain")
-	local lastPkts, lastInner = 0ULL, 0ULL
+	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
 	while mg.running() do
-		if ipsec.rxDecrypt(queue, bufs, saTable, #sas, args.spi_base, st) > 0 then
-			-- throughput of the decrypted inner IP packets (without L2 header/CRC)
-			local pkts, inner = st.ok_pkts - lastPkts, st.inner_bytes - lastInner
-			lastPkts, lastInner = st.ok_pkts, st.inner_bytes
-			ctr:update(tonumber(pkts), tonumber(inner))
+		ipsec.rxDecrypt(queue, bufs, saTable, #sas, args.spi_base, st)
+	end
+	local res = {}
+	for i, k in ipairs(FIELDS) do
+		res[i] = tonumber(st[k])
+	end
+	log:info("Queue %d: " .. SUMMARY, core, unpack(res))
+	-- per SA: packets missing between the first and the last sequence number received (the sender starts at 1)
+	local missing = 0
+	for i, sa in ipairs(sas) do
+		local seen, first, last = ipsec.rxRange(sa)
+		if seen > 0 then
+			log:info("Queue %d: SPI %d: ESP sequence numbers %d..%d, received %d, missing in between %d",
+				core, args.spi_base + i - 1, first, last, seen, last - first + 1 - seen)
+			missing = missing + last - first + 1 - seen
 		end
 	end
-	ctr:finalize()
-	local res = {}
-	for _, k in ipairs{"rx_pkts", "rx_bytes", "ok_pkts", "inner_bytes", "non_esp", "unknown_spi", "prepare_drops", "auth_fails"} do
-		res[k] = tonumber(st[k])
-	end
-	log:info("Queue %d: received %d, decrypted %d, auth failures %d, replay/malformed drops %d, unknown SPI %d, non-ESP %d",
-		core, res.rx_pkts, res.ok_pkts, res.auth_fails, res.prepare_drops, res.unknown_spi, res.non_esp)
+	res[#FIELDS + 1] = missing
 	return res
 end

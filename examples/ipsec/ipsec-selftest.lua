@@ -1,6 +1,6 @@
 --- Functional self test of the software IPsec path, no NIC needed:
 --- encrypt -> decrypt round trip, ICV tampering and replay detection, tunnel and transport mode.
---- ./build/MoonGen --dpdk-config=examples/ipsec/dpdk-conf.lua examples/ipsec/ipsec-selftest.lua
+--- ./build/MoonGen examples/ipsec/ipsec-selftest.lua --dpdk-config=examples/ipsec/dpdk-conf.lua
 local mg     = require "moongen"
 local memory = require "memory"
 local log    = require "log"

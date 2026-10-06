@@ -7,6 +7,7 @@
 
 local ffi = require "ffi"
 local log = require "log"
+require "filter" -- rte_flow declarations
 
 local C = ffi.C
 
@@ -15,9 +16,7 @@ ffi.cdef[[
 
 	struct mg_ipsec_rx_stats {
 		uint64_t rx_pkts;
-		uint64_t rx_bytes;
 		uint64_t ok_pkts;
-		uint64_t inner_bytes;
 		uint64_t non_esp;
 		uint64_t unknown_spi;
 		uint64_t prepare_drops;
@@ -29,6 +28,7 @@ ffi.cdef[[
 		const uint8_t* key, uint32_t key_len, uint32_t replay_win,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket);
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
+	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
 		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* fails);
 	uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok);
@@ -136,6 +136,51 @@ function mod.createSaTable(sas)
 		tbl[i - 1] = sa
 	end
 	return tbl
+end
+
+-- One rte_flow rule in the NIC: IPv4 packets matching the optional IPv4 and ESP items go to rxQueue.
+local function steer(rxQueue, what, ip, esp)
+	local attr = ffi.new("struct rte_flow_attr", { ingress = 1 })
+	local items = ffi.new("struct rte_flow_item[4]")
+	items[0].type = C.RTE_FLOW_ITEM_TYPE_ETH
+	items[1].type = C.RTE_FLOW_ITEM_TYPE_IPV4
+	if ip then items[1].spec, items[1].mask = ip[1], ip[2] end
+	items[2].type = esp and C.RTE_FLOW_ITEM_TYPE_ESP or C.RTE_FLOW_ITEM_TYPE_END
+	if esp then items[2].spec, items[2].mask = esp[1], esp[2] end
+	items[3].type = C.RTE_FLOW_ITEM_TYPE_END
+	local queue = ffi.new("struct rte_flow_action_queue", { index = rxQueue.qid })
+	local actions = ffi.new("struct rte_flow_action[2]")
+	actions[0].type, actions[0].conf = C.RTE_FLOW_ACTION_TYPE_QUEUE, queue
+	actions[1].type = C.RTE_FLOW_ACTION_TYPE_END
+	local err = ffi.new("struct rte_flow_error")
+	if C.rte_flow_create(rxQueue.id, attr, items, actions, err) == nil then
+		log:fatal("Could not steer %s to queue %d: %s", what, rxQueue.qid, err.message ~= nil and ffi.string(err.message) or "unknown error")
+	end
+end
+
+--- Steer all ESP packets with the given SPI to one RX queue (rte_flow rule in the NIC).
+--- Unlike RSS this does not depend on the IP addresses, so every SA gets a defined core.
+function mod.steerSpi(rxQueue, spi)
+	local spec, mask = ffi.new("struct rte_flow_item_esp"), ffi.new("struct rte_flow_item_esp")
+	spec.hdr.spi = bit.bswap(spi) % 2^32 -- network byte order
+	mask.hdr.spi = 0xffffffff
+	steer(rxQueue, "SPI " .. spi, nil, { spec, mask })
+end
+
+--- Steer all IPv4 packets with the given source address to one RX queue (for the cleartext flows).
+function mod.steerSrcIp(rxQueue, ip)
+	local spec, mask = ffi.new("struct rte_flow_item_ipv4"), ffi.new("struct rte_flow_item_ipv4")
+	spec.hdr.src_addr = bit.bswap(ip4(ip)) % 2^32 -- network byte order
+	mask.hdr.src_addr = 0xffffffff
+	steer(rxQueue, "source IP " .. tostring(ip), { spec, mask })
+end
+
+--- First and last ESP sequence number mod.rxDecrypt received for this SA.
+--- @return number of packets received, first sequence number, last sequence number
+function mod.rxRange(sa)
+	local range = ffi.new("uint32_t[2]")
+	local seen = tonumber(C.mg_ipsec_sa_rx_range(sa, range, range + 1))
+	return seen, range[0], range[1]
 end
 
 function mod.newRxStats()
