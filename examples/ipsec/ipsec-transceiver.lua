@@ -39,7 +39,10 @@ function configure(parser)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
 	parser:flag("--rss", "Distribute the SAs received by RSS hash of the outer IPs instead of one rte_flow rule per SPI.")
-	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("--tx-delay", "Seconds to wait before sending, so that the receivers of the peer are ready."):default(2):convert(tonumber)
+	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
+	parser:option("--rx-linger", "Seconds to keep receiving after the own senders have stopped, to collect what the peer still sends."):default(2):convert(tonumber)
 end
 
 function master(args)
@@ -52,7 +55,13 @@ function master(args)
 	for i = 0, args.rss and -1 or args.sas - 1 do
 		ipsec.steerSpi(dev:getRxQueue(i % args.rx_cores), args.spi_base + i)
 	end
-	if args.time > 0 then mg.setRuntime(args.time) end
+	-- the two nodes do not start at the same instant: the senders wait txDelay before they start and the
+	-- receivers run rxLinger longer than the senders, so that neither end of the run shows up as loss
+	args.txStart = mg.getTime() + args.tx_delay
+	-- with a rate limit the senders start slowly: the start of the own transmit tasks disturbs the receive tasks
+	-- of the same process for a moment, which must not coincide with the full rate of the peer
+	if args.rate <= 0 then args.ramp = 0 end
+	if args.time > 0 then mg.setRuntime(args.tx_delay + args.ramp + args.time) end
 	-- receivers first, so that they are ready when the peer and the own senders start
 	local rxTasks, txTasks = {}, {}
 	for i = 0, args.rx_cores - 1 do
@@ -72,16 +81,18 @@ function master(args)
 	rxCtr:finalize()
 	local fails, sent, rate = 0, 0, 0
 	for i = 0, args.tx_cores - 1 do
-		local f, s, r = txTasks[i]:wait()
-		log:info("Core %d: SPI %d, packets sent %d", i, args.spi_base + i, s)
+		local f, s, r, lag, lagAt, phases = txTasks[i]:wait()
+		log:info("Core %d: SPI %d, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, args.spi_base + i, s, lag * 1e3, lagAt, phases)
 		fails, sent, rate = fails + f, sent + s, rate + r
 	end
 	log:info("Encryption failures: %d, packets sent: %d, rate %.2f Mpps", fails, sent, rate)
 	local total = {0, 0, 0, 0, 0, 0, 0}
 	for i = 0, args.rx_cores - 1 do
-		for k, v in ipairs(rxTasks[i]:wait()) do
+		local res, gap, gapAt = rxTasks[i]:wait()
+		for k, v in ipairs(res) do
 			total[k] = total[k] + v
 		end
+		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
 	local nic = dev:getStats()
@@ -124,11 +135,39 @@ function txSlave(queue, core, args)
 	local first = true
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.tx_cores / (args.rate * 1e6) or 0
+	while mg.running() and mg.getTime() < args.txStart do
+		mg.sleepMillis(1)
+	end
 	local start, sent = mg.getTime(), 0
+	-- the achieved rate is measured from the end of the ramp on
+	local fullStart, fullSent = args.ramp > 0 and start + args.ramp or start, 0
+	local ramping = args.ramp > 0
+	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the senders started)
+	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
+	local maxLag, maxLagAt, phases, behind = 0, 0, 0, false
 	local nextSend = start
 	while mg.running() do
 		while mg.getTime() < nextSend do end
-		nextSend = math.max(nextSend, mg.getTime() - 0.01) + interval
+		local now = mg.getTime()
+		if interval > 0 then
+			local lag = now - nextSend
+			if lag > maxLag then maxLag, maxLagAt = lag, now - args.txStart end
+			if lag > 0.0001 then
+				if not behind then behind, phases = true, phases + 1 end
+			else
+				behind = false
+			end
+		end
+		if ramping then
+			if now >= fullStart then
+				ramping, fullStart, fullSent = false, now, sent
+				nextSend = math.max(nextSend, now - 0.01) + interval
+			else
+				nextSend = now + interval / math.max((now - start) / args.ramp, 0.01)
+			end
+		else
+			nextSend = math.max(nextSend, now - 0.01) + interval
+		end
 		bufs:alloc(args.size)
 		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails)
 		if n > 0 then
@@ -140,11 +179,11 @@ function txSlave(queue, core, args)
 			sent = sent + n
 		end
 	end
-	local rate = sent / (mg.getTime() - start) / 1e6
+	local rate = (sent - fullSent) / (mg.getTime() - fullStart) / 1e6
 	if rate < 0.99 * args.rate / args.tx_cores then
 		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.tx_cores)
 	end
-	return tonumber(fails[0]), sent, rate
+	return tonumber(fails[0]), sent, rate, maxLag, maxLagAt, phases
 end
 
 function rxSlave(queue, core, args)
@@ -166,8 +205,14 @@ function rxSlave(queue, core, args)
 	local st = ipsec.newRxStats()
 	local bufs = memory.bufArray(args.burst)
 	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
-	while mg.running() do
+	local linger = args.rx_linger * 1000
+	-- diagnosis: longest time between two receive calls while the senders run, i.e. the longest stall of this task
+	local last, maxGap, maxGapAt = mg.getTime(), 0, 0
+	while mg.running(linger) do
 		ipsec.rxDecrypt(queue, bufs, saTable, #sas, args.spi_base, st)
+		local now = mg.getTime()
+		if now - last > maxGap and now > args.txStart then maxGap, maxGapAt = now - last, now - args.txStart end
+		last = now
 	end
 	local res = {}
 	for i, k in ipairs(FIELDS) do
@@ -185,5 +230,5 @@ function rxSlave(queue, core, args)
 		end
 	end
 	res[#FIELDS + 1] = missing
-	return res
+	return res, maxGap, maxGapAt
 end
