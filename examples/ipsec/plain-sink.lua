@@ -21,11 +21,12 @@ function configure(parser)
 	parser:flag("--rss", "Distribute the flows by RSS hash instead of one rte_flow rule per source IP.")
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
+	parser:flag("--offloads", "Keep libmoon's default receive offloads (checksum verification, VLAN, timestamps) instead of switching them off.")
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 end
 
 function master(args)
-	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = true}
+	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
 	for i = 0, args.rss and -1 or args.flows - 1 do
 		ipsec.steerSrcIp(rxDev:getRxQueue(i % args.cores), parseIP4Address(args.src) + i)
@@ -46,6 +47,7 @@ function master(args)
 	for q = 0, args.cores - 1 do
 		local res = tasks[q]:wait()
 		other = other + res.other
+		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", q, res.maxGap * 1e3, res.maxGapAt)
 		for id, f in pairs(res.flows) do
 			if not flows[id] then
 				flows[id], ids[#ids + 1] = {rx = 0, lost = 0, late = 0, queues = {}}, id
@@ -73,8 +75,15 @@ end
 function rxSlave(queue, burst)
 	local bufs = memory.bufArray(burst)
 	local flows, other = {}, 0
+	-- diagnosis: longest time between two receive calls, i.e. the longest stall of this task; the time given is
+	-- in seconds after the first second of this task
+	local last = mg.getTime()
+	local ref, maxGap, maxGapAt = last + 1, 0, 0
 	while mg.running() do
 		local n = queue:tryRecv(bufs, 0)
+		local now = mg.getTime()
+		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
+		last = now
 		for i = 1, n do
 			local payload = bufs[i]:getUdpPacket().payload
 			if bufs[i]:getSize() >= 58 and payload.uint32[0] == MAGIC then
@@ -99,5 +108,5 @@ function rxSlave(queue, burst)
 		end
 		bufs:free(n)
 	end
-	return {flows = flows, other = other}
+	return {flows = flows, other = other, maxGap = maxGap, maxGapAt = maxGapAt}
 end

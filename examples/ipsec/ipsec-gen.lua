@@ -24,7 +24,9 @@ function configure(parser)
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
-	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("--tx-delay", "Seconds to wait before sending."):default(0):convert(tonumber)
+	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
 end
 
 function master(args)
@@ -33,7 +35,7 @@ function master(args)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores}
 	device.waitForLinks()
 	ipsec.init(args.cores + 16)
-	if args.time > 0 then mg.setRuntime(args.time) end
+	txSetup(args)
 	local tasks = {}
 	for i = 0, args.cores - 1 do
 		tasks[i] = mg.startTask("txSlave", txDev:getTxQueue(i), i, args)
@@ -44,10 +46,25 @@ function master(args)
 		mg.sleepMillisIdle(10)
 	end
 	ctr:finalize()
+	txSummary(tasks, args)
+end
+
+--- Fixes the start of the senders and the run time; to be called once before the transmit tasks are started
+--- (also used by ipsec-transceiver.lua).
+function txSetup(args)
+	args.txStart = mg.getTime() + args.tx_delay
+	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold
+	-- caches and, in ipsec-transceiver.lua, while the transmit tasks of its own process are starting
+	if args.rate <= 0 then args.ramp = 0 end
+	if args.time > 0 then mg.setRuntime(args.tx_delay + args.ramp + args.time) end
+end
+
+--- Waits for the transmit tasks and prints their results (also used by ipsec-transceiver.lua).
+function txSummary(tasks, args)
 	local fails, sent, rate = 0, 0, 0
 	for i = 0, args.cores - 1 do
-		local f, s, r = tasks[i]:wait()
-		log:info("Core %d: SPI %d, packets sent %d", i, args.spi_base + i, s)
+		local f, s, r, lag, lagAt, phases = tasks[i]:wait()
+		log:info("Core %d: SPI %d, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, args.spi_base + i, s, lag * 1e3, lagAt, phases)
 		fails, sent, rate = fails + f, sent + s, rate + r
 	end
 	log:info("Encryption failures: %d, packets sent: %d, rate %.2f Mpps", fails, sent, rate)
@@ -88,11 +105,39 @@ function txSlave(queue, core, args)
 	local first = true
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
+	while mg.running() and mg.getTime() < args.txStart do
+		mg.sleepMillis(1)
+	end
 	local start, sent = mg.getTime(), 0
+	-- the achieved rate is measured from the end of the ramp on
+	local fullStart, fullSent = args.ramp > 0 and start + args.ramp or start, 0
+	local ramping = args.ramp > 0
+	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the senders started)
+	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
+	local maxLag, maxLagAt, phases, behind = 0, 0, 0, false
 	local nextSend = start
 	while mg.running() do
 		while mg.getTime() < nextSend do end
-		nextSend = math.max(nextSend, mg.getTime() - 0.01) + interval
+		local now = mg.getTime()
+		if interval > 0 then
+			local lag = now - nextSend
+			if lag > maxLag then maxLag, maxLagAt = lag, now - args.txStart end
+			if lag > 0.0001 then
+				if not behind then behind, phases = true, phases + 1 end
+			else
+				behind = false
+			end
+		end
+		if ramping then
+			if now >= fullStart then
+				ramping, fullStart, fullSent = false, now, sent
+				nextSend = math.max(nextSend, now - 0.01) + interval
+			else
+				nextSend = now + interval / math.max((now - start) / args.ramp, 0.01)
+			end
+		else
+			nextSend = math.max(nextSend, now - 0.01) + interval
+		end
 		bufs:alloc(args.size)
 		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails)
 		if n > 0 then
@@ -104,9 +149,9 @@ function txSlave(queue, core, args)
 			sent = sent + n
 		end
 	end
-	local rate = sent / (mg.getTime() - start) / 1e6
+	local rate = (sent - fullSent) / (mg.getTime() - fullStart) / 1e6
 	if rate < 0.99 * args.rate / args.cores then
 		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.cores)
 	end
-	return tonumber(fails[0]), sent, rate
+	return tonumber(fails[0]), sent, rate, maxLag, maxLagAt, phases
 end

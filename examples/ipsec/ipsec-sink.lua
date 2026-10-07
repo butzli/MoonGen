@@ -28,13 +28,14 @@ function configure(parser)
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
+	parser:flag("--offloads", "Keep libmoon's default receive offloads (checksum verification, VLAN, timestamps) instead of switching them off.")
 	parser:flag("--rss", "Distribute the SAs by RSS hash of the outer IPs instead of one rte_flow rule per SPI.")
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 end
 
 function master(args)
 	args.key = args.key or ipsec.testKey(args.bits)
-	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = true}
+	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
 	ipsec.init(args.cores * args.sas + 16)
 	for i = 0, args.rss and -1 or args.sas - 1 do
@@ -51,11 +52,18 @@ function master(args)
 		mg.sleepMillisIdle(10)
 	end
 	ctr:finalize()
+	rxSummary(tasks, args, rxDev)
+end
+
+--- Waits for the receive tasks and prints their results (also used by ipsec-transceiver.lua).
+function rxSummary(tasks, args, rxDev)
 	local total = {0, 0, 0, 0, 0, 0, 0}
 	for i = 0, args.cores - 1 do
-		for k, v in ipairs(tasks[i]:wait()) do
+		local res, gap, gapAt = tasks[i]:wait()
+		for k, v in ipairs(res) do
 			total[k] = total[k] + v
 		end
+		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
 	local nic = rxDev:getStats()
@@ -82,8 +90,17 @@ function rxSlave(queue, core, args)
 	local st = ipsec.newRxStats()
 	local bufs = memory.bufArray(args.burst)
 	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
-	while mg.running() do
+	-- ipsec-transceiver.lua keeps receiving for rx_linger seconds after its own senders have stopped
+	local linger = (args.rx_linger or 0) * 1000
+	-- diagnosis: longest time between two receive calls, i.e. the longest stall of this task; the time given is
+	-- in seconds after the start of the senders (ipsec-transceiver.lua) or after the first second of this task
+	local last = mg.getTime()
+	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
+	while mg.running(linger) do
 		ipsec.rxDecrypt(queue, bufs, saTable, #sas, args.spi_base, st)
+		local now = mg.getTime()
+		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
+		last = now
 	end
 	local res = {}
 	for i, k in ipairs(FIELDS) do
@@ -101,5 +118,5 @@ function rxSlave(queue, core, args)
 		end
 	end
 	res[#FIELDS + 1] = missing
-	return res
+	return res, maxGap, maxGapAt
 end

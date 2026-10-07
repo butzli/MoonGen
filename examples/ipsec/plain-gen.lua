@@ -21,14 +21,17 @@ function configure(parser)
 	parser:option("--dst-mac", "Destination MAC."):default("ff:ff:ff:ff:ff:ff")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
-	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
 end
 
 function master(args)
 	if args.size < 58 then log:fatal("Packet size must be at least 58") end
 	local txDev = device.config{port = args.txDev, txQueues = args.cores}
 	device.waitForLinks()
-	if args.time > 0 then mg.setRuntime(args.time) end
+	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold caches
+	if args.rate <= 0 then args.ramp = 0 end
+	if args.time > 0 then mg.setRuntime(args.ramp + args.time) end
 	local tasks = {}
 	for i = 0, args.cores - 1 do
 		tasks[i] = mg.startTask("txSlave", txDev:getTxQueue(i), i, args)
@@ -41,8 +44,8 @@ function master(args)
 	ctr:finalize()
 	local total, totalRate = 0, 0
 	for i = 0, args.cores - 1 do
-		local sent, rate = tasks[i]:wait()
-		log:info("Flow %d: sent %d", i, sent)
+		local sent, rate, lag, lagAt, phases = tasks[i]:wait()
+		log:info("Flow %d: sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, sent, lag * 1e3, lagAt, phases)
 		total, totalRate = total + sent, totalRate + rate
 	end
 	log:info("Total: sent %d, rate %.2f Mpps", total, totalRate)
@@ -70,10 +73,35 @@ function txSlave(queue, flow, args)
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
 	local start = mg.getTime()
+	-- the achieved rate is measured from the end of the ramp on
+	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp or start, 0
+	local ramping = args.ramp > 0
+	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the start)
+	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
+	local maxLag, maxLagAt, phases, behind = 0, 0, 0, false
 	local nextSend = start
 	while mg.running() do
 		while mg.getTime() < nextSend do end
-		nextSend = math.max(nextSend, mg.getTime() - 0.01) + interval
+		local now = mg.getTime()
+		if interval > 0 then
+			local lag = now - nextSend
+			if lag > maxLag then maxLag, maxLagAt = lag, now - start end
+			if lag > 0.0001 then
+				if not behind then behind, phases = true, phases + 1 end
+			else
+				behind = false
+			end
+		end
+		if ramping then
+			if now >= fullStart then
+				ramping, fullStart, fullSeq = false, now, seq
+				nextSend = math.max(nextSend, now - 0.01) + interval
+			else
+				nextSend = now + interval / math.max((now - start) / args.ramp, 0.01)
+			end
+		else
+			nextSend = math.max(nextSend, now - 0.01) + interval
+		end
 		bufs:alloc(args.size)
 		for _, buf in ipairs(bufs) do
 			buf:getUdpPacket().payload.uint64[1] = seq
@@ -81,9 +109,9 @@ function txSlave(queue, flow, args)
 		end
 		queue:send(bufs)
 	end
-	local rate = seq / (mg.getTime() - start) / 1e6
+	local rate = (seq - fullSeq) / (mg.getTime() - fullStart) / 1e6
 	if rate < 0.99 * args.rate / args.cores then
 		log:warn("Flow %d: reached only %.2f of %.2f Mpps", flow, rate, args.rate / args.cores)
 	end
-	return seq, rate
+	return seq, rate, maxLag, maxLagAt, phases
 end

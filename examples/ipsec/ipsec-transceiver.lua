@@ -1,5 +1,5 @@
---- ESP (AES-GCM) generator and receiver/decoder on the same port: ipsec-gen.lua and ipsec-sink.lua in one process,
---- for bidirectional tests between two nodes that both run this script.
+--- ESP (AES-GCM) generator and receiver/decoder on the same port: the transmit tasks of ipsec-gen.lua and the
+--- receive tasks of ipsec-sink.lua in one process, for bidirectional tests between two nodes that both run this script.
 --- Sending: one TX queue, one core and one outbound SA per TX core; SA i uses SPI spiBase + i and outer
 --- addresses tunnelLocal + i -> tunnelRemote.
 --- Receiving: inbound SAs for the SPIs spiBase + i with outer addresses tunnelRemote + i -> tunnelLocal; one
@@ -10,15 +10,14 @@
 --- Node B: the same with --tunnel-local 192.168.1.1 --tunnel-remote 192.168.0.1
 --- It also works against ipsec-gen.lua and ipsec-sink.lua with their default addresses on node A.
 local mg     = require "moongen"
-local memory = require "memory"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
-local ffi    = require "ffi"
 local ipsec  = require "ipsec-sw"
-
-local SUMMARY = "received %d, decrypted+authenticated %d, auth/ICV failures %d, replay/malformed drops %d, unknown SPI %d, non-ESP %d"
-local FIELDS  = {"rx_pkts", "ok_pkts", "auth_fails", "prepare_drops", "unknown_spi", "non_esp"}
+-- txSlave, txSetup and txSummary come from ipsec-gen.lua, rxSlave and rxSummary from ipsec-sink.lua;
+-- configure and master of these two files are replaced by the ones below
+require "ipsec-gen"
+require "ipsec-sink"
 
 function configure(parser)
 	parser:description("Sends ESP/AES-GCM encrypted UDP traffic and receives, decrypts and verifies the traffic of its peer on the same port.")
@@ -55,20 +54,24 @@ function master(args)
 	for i = 0, args.rss and -1 or args.sas - 1 do
 		ipsec.steerSpi(dev:getRxQueue(i % args.rx_cores), args.spi_base + i)
 	end
-	-- the two nodes do not start at the same instant: the senders wait txDelay before they start and the
-	-- receivers run rxLinger longer than the senders, so that neither end of the run shows up as loss
-	args.txStart = mg.getTime() + args.tx_delay
-	-- with a rate limit the senders start slowly: the start of the own transmit tasks disturbs the receive tasks
-	-- of the same process for a moment, which must not coincide with the full rate of the peer
-	if args.rate <= 0 then args.ramp = 0 end
-	if args.time > 0 then mg.setRuntime(args.tx_delay + args.ramp + args.time) end
+	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
+	local tx, rx = {}, {}
+	for k, v in pairs(args) do
+		tx[k], rx[k] = v, v
+	end
+	tx.cores, tx.tunnel_src, tx.tunnel_dst = args.tx_cores, args.tunnel_local, args.tunnel_remote
+	rx.cores, rx.tunnel_src, rx.tunnel_dst = args.rx_cores, args.tunnel_remote, args.tunnel_local
+	-- the two nodes do not start at the same instant: the senders wait tx_delay before they start and the
+	-- receivers run rx_linger longer than the senders, so that neither end of the run shows up as loss
+	txSetup(tx)
+	rx.txStart = tx.txStart
 	-- receivers first, so that they are ready when the peer and the own senders start
 	local rxTasks, txTasks = {}, {}
 	for i = 0, args.rx_cores - 1 do
-		rxTasks[i] = mg.startTask("rxSlave", dev:getRxQueue(i), i, args)
+		rxTasks[i] = mg.startTask("rxSlave", dev:getRxQueue(i), i, rx)
 	end
 	for i = 0, args.tx_cores - 1 do
-		txTasks[i] = mg.startTask("txSlave", dev:getTxQueue(i), i, args)
+		txTasks[i] = mg.startTask("txSlave", dev:getTxQueue(i), i, tx)
 	end
 	local txCtr = stats:newDevTxCounter(dev, "plain")
 	local rxCtr = stats:newDevRxCounter(dev, "plain")
@@ -79,156 +82,6 @@ function master(args)
 	end
 	txCtr:finalize()
 	rxCtr:finalize()
-	local fails, sent, rate = 0, 0, 0
-	for i = 0, args.tx_cores - 1 do
-		local f, s, r, lag, lagAt, phases = txTasks[i]:wait()
-		log:info("Core %d: SPI %d, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, args.spi_base + i, s, lag * 1e3, lagAt, phases)
-		fails, sent, rate = fails + f, sent + s, rate + r
-	end
-	log:info("Encryption failures: %d, packets sent: %d, rate %.2f Mpps", fails, sent, rate)
-	local total = {0, 0, 0, 0, 0, 0, 0}
-	for i = 0, args.rx_cores - 1 do
-		local res, gap, gapAt = rxTasks[i]:wait()
-		for k, v in ipairs(res) do
-			total[k] = total[k] + v
-		end
-		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
-	end
-	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
-	local nic = dev:getStats()
-	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
-		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
-end
-
-function txSlave(queue, core, args)
-	local sa = ipsec.createSa{
-		dir = "out",
-		mode = args.mode,
-		spi = args.spi_base + core,
-		key = args.key,
-		src = parseIP4Address(args.tunnel_local) + core,
-		dst = args.tunnel_remote,
-		srcMac = queue.dev:getMacString(),
-		dstMac = args.dst_mac,
-		socket = select(2, mg.getCore()),
-	}
-	local mem = memory.createMemPool{n = 8191}
-	local bufs = mem:bufArray(args.burst)
-	-- inner packet template: encryption happens in place, so every mbuf is re-filled from it before each use
-	bufs:alloc(args.size)
-	local pkt = bufs[1]:getUdpPacket()
-	pkt:fill{
-		ethSrc = queue,
-		ethDst = args.dst_mac,
-		ip4Src = parseIP4Address("10.0.0.1") + core,
-		ip4Dst = "10.1.0.1",
-		udpSrc = 1234,
-		udpDst = 5678,
-		pktLength = args.size,
-	}
-	pkt.ip4:calculateChecksum()
-	pkt.udp:setChecksum(0)
-	local tmpl = ffi.new("uint8_t[?]", args.size)
-	ffi.copy(tmpl, bufs[1]:getData(), args.size)
-	bufs:freeAll()
-	local fails = ffi.new("uint64_t[1]")
-	local first = true
-	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
-	local interval = args.rate > 0 and args.burst * args.tx_cores / (args.rate * 1e6) or 0
-	while mg.running() and mg.getTime() < args.txStart do
-		mg.sleepMillis(1)
-	end
-	local start, sent = mg.getTime(), 0
-	-- the achieved rate is measured from the end of the ramp on
-	local fullStart, fullSent = args.ramp > 0 and start + args.ramp or start, 0
-	local ramping = args.ramp > 0
-	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the senders started)
-	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
-	local maxLag, maxLagAt, phases, behind = 0, 0, 0, false
-	local nextSend = start
-	while mg.running() do
-		while mg.getTime() < nextSend do end
-		local now = mg.getTime()
-		if interval > 0 then
-			local lag = now - nextSend
-			if lag > maxLag then maxLag, maxLagAt = lag, now - args.txStart end
-			if lag > 0.0001 then
-				if not behind then behind, phases = true, phases + 1 end
-			else
-				behind = false
-			end
-		end
-		if ramping then
-			if now >= fullStart then
-				ramping, fullStart, fullSent = false, now, sent
-				nextSend = math.max(nextSend, now - 0.01) + interval
-			else
-				nextSend = now + interval / math.max((now - start) / args.ramp, 0.01)
-			end
-		else
-			nextSend = math.max(nextSend, now - 0.01) + interval
-		end
-		bufs:alloc(args.size)
-		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails)
-		if n > 0 then
-			if first then
-				first = false
-				log:info("Core %d: SPI %d, inner frame %d B -> ESP frame %d B", core, args.spi_base + core, args.size, bufs.array[0].pkt_len)
-			end
-			queue:sendN(bufs, n)
-			sent = sent + n
-		end
-	end
-	local rate = (sent - fullSent) / (mg.getTime() - fullStart) / 1e6
-	if rate < 0.99 * args.rate / args.tx_cores then
-		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.tx_cores)
-	end
-	return tonumber(fails[0]), sent, rate, maxLag, maxLagAt, phases
-end
-
-function rxSlave(queue, core, args)
-	-- own inbound SA instances for all SPIs; only those arriving on this queue are ever used
-	local sas = {}
-	for i = 0, args.sas - 1 do
-		sas[i + 1] = ipsec.createSa{
-			dir = "in",
-			mode = args.mode,
-			spi = args.spi_base + i,
-			key = args.key,
-			src = parseIP4Address(args.tunnel_remote) + i,
-			dst = args.tunnel_local,
-			replayWindow = args.replay_window,
-			socket = select(2, mg.getCore()),
-		}
-	end
-	local saTable = ipsec.createSaTable(sas)
-	local st = ipsec.newRxStats()
-	local bufs = memory.bufArray(args.burst)
-	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
-	local linger = args.rx_linger * 1000
-	-- diagnosis: longest time between two receive calls while the senders run, i.e. the longest stall of this task
-	local last, maxGap, maxGapAt = mg.getTime(), 0, 0
-	while mg.running(linger) do
-		ipsec.rxDecrypt(queue, bufs, saTable, #sas, args.spi_base, st)
-		local now = mg.getTime()
-		if now - last > maxGap and now > args.txStart then maxGap, maxGapAt = now - last, now - args.txStart end
-		last = now
-	end
-	local res = {}
-	for i, k in ipairs(FIELDS) do
-		res[i] = tonumber(st[k])
-	end
-	log:info("Queue %d: " .. SUMMARY, core, unpack(res))
-	-- per SA: packets missing between the first and the last sequence number received (the sender starts at 1)
-	local missing = 0
-	for i, sa in ipairs(sas) do
-		local seen, first, last = ipsec.rxRange(sa)
-		if seen > 0 then
-			log:info("Queue %d: SPI %d: ESP sequence numbers %d..%d, received %d, missing in between %d",
-				core, args.spi_base + i - 1, first, last, seen, last - first + 1 - seen)
-			missing = missing + last - first + 1 - seen
-		end
-	end
-	res[#FIELDS + 1] = missing
-	return res, maxGap, maxGapAt
+	txSummary(txTasks, tx)
+	rxSummary(rxTasks, rx, dev)
 end
