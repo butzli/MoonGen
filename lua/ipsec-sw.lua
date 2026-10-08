@@ -25,7 +25,7 @@ ffi.cdef[[
 
 	int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket);
 	struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
-		const uint8_t* key, uint32_t key_len, uint32_t replay_win,
+		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket);
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
 	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last);
@@ -108,13 +108,14 @@ end
 ---   src, dst    outer IPv4 addresses (tunnel mode)
 ---   srcMac, dstMac  Ethernet addresses of the encrypted frames (outbound tunnel mode)
 ---   replayWindow    anti-replay window size for inbound SAs (default 64, 0 disables)
+---   esn         true: extended (64 bit) sequence numbers
 function mod.createSa(args)
 	local outbound = args.dir == "out"
 	local tunnel = (args.mode or "tunnel") == "tunnel"
 	local key, keyLen = mod.parseKey(args.key)
 	local srcMac, dstMac = mac(args.srcMac), mac(args.dstMac)
 	local sa = C.mg_ipsec_sa_create(outbound and 1 or 0, tunnel and 1 or 0, args.spi,
-		key, keyLen, args.replayWindow or 64,
+		key, keyLen, args.replayWindow or 64, args.esn and 1 or 0,
 		tunnel and ip4(args.src) or 0, tunnel and ip4(args.dst) or 0,
 		srcMac, dstMac, args.socket or 0)
 	if sa == nil then
@@ -129,6 +130,43 @@ function mod.encrypt(sa, bufs, n, tmpl, tmplLen, fails)
 	return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, fails)
 end
 
+--- Read a list of SAs that were set up elsewhere, e.g. negotiated by an IKE daemon.
+--- One SA per line: direction ("out" = to be sent, "in" = to be received), SPI, key (hex, AES key + 4 byte
+--- salt), outer source and destination address and optionally the inner source and destination address the
+--- SA is meant for, and "esn" as last word if it uses extended sequence numbers; "#" starts a comment.
+--- The same file serves a generator, a sink and a transceiver.
+--- @param dir "out" or "in": the SAs of the other direction are skipped
+--- @return list of { spi, key, src, dst, innerSrc, innerDst, esn }
+function mod.loadSaFile(path, dir)
+	local file = io.open(path)
+	if not file then
+		log:fatal("Could not open SA file %s", path)
+	end
+	local list = {}
+	for line in file:lines() do
+		local f = {}
+		for word in line:gsub("#.*", ""):gmatch("%S+") do
+			f[#f + 1] = word
+		end
+		local esn = f[#f] == "esn"
+		if esn then
+			f[#f] = nil
+		end
+		if #f >= 5 and (f[1] == "out" or f[1] == "in") and tonumber(f[2]) then
+			if f[1] == dir then
+				list[#list + 1] = { spi = tonumber(f[2]), key = f[3], src = f[4], dst = f[5], innerSrc = f[6], innerDst = f[7], esn = esn }
+			end
+		elseif #f > 0 then
+			log:fatal("Invalid line in SA file %s: %s", path, line)
+		end
+	end
+	file:close()
+	if #list == 0 then
+		log:fatal("No \"%s\" SAs in SA file %s", dir, path)
+	end
+	return list
+end
+
 --- Create an SA lookup table indexed by SPI - spiBase for mod.rxDecrypt.
 function mod.createSaTable(sas)
 	local tbl = ffi.new("struct mg_ipsec_sa*[?]", #sas)
@@ -136,6 +174,26 @@ function mod.createSaTable(sas)
 		tbl[i - 1] = sa
 	end
 	return tbl
+end
+
+--- Create an SA lookup table for arbitrary SPIs for mod.rxDecrypt (to be called with spiBase = 0):
+--- a hash table indexed by the low bits of the SPI with linear probing, at most half full.
+--- @param spis the SPIs of the SAs, in the same order
+--- @return table, number of slots (= numSas of mod.rxDecrypt)
+function mod.createSpiTable(sas, spis)
+	local slots = 2
+	while slots < 2 * #sas do
+		slots = slots * 2
+	end
+	local tbl = ffi.new("struct mg_ipsec_sa*[?]", slots)
+	for i, sa in ipairs(sas) do
+		local slot = bit.band(spis[i], slots - 1)
+		while tbl[slot] ~= nil do
+			slot = bit.band(slot + 1, slots - 1)
+		end
+		tbl[slot] = sa
+	end
+	return tbl, slots
 end
 
 -- One rte_flow rule in the NIC: IPv4 packets matching the optional IPv4 and ESP items go to rxQueue.
@@ -155,6 +213,17 @@ local function steer(rxQueue, what, ip, esp)
 	local err = ffi.new("struct rte_flow_error")
 	if C.rte_flow_create(rxQueue.id, attr, items, actions, err) == nil then
 		log:fatal("Could not steer %s to queue %d: %s", what, rxQueue.qid, err.message ~= nil and ffi.string(err.message) or "unknown error")
+	end
+end
+
+--- Flow isolation: the port only receives what an rte_flow rule (steerSpi, steerSrcIp) sends to one of its queues.
+--- Everything else stays with the kernel driver of the port, which thereby keeps answering ARP and receiving IKE
+--- while this application runs; without isolation the application takes all frames of the port and drops those.
+--- Works with bifurcated drivers (mlx5); to be called before device.config.
+function mod.isolate(port)
+	local err = ffi.new("struct rte_flow_error")
+	if C.rte_flow_isolate(port, 1, err) ~= 0 then
+		log:fatal("Could not isolate port %d: %s", port, err.message ~= nil and ffi.string(err.message) or "unknown error")
 	end
 end
 

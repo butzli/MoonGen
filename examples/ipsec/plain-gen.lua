@@ -8,6 +8,7 @@ local memory = require "memory"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
+local ipsec  = require "ipsec-sw" -- only for the flow isolation
 
 local MAGIC = 0x504c4149 -- "PLAI"
 
@@ -27,6 +28,8 @@ end
 
 function master(args)
 	if args.size < 58 then log:fatal("Packet size must be at least 58") end
+	-- nothing is received here: all incoming frames stay with the kernel (ARP)
+	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores}
 	device.waitForLinks()
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold caches

@@ -32,7 +32,8 @@ struct mg_ipsec_sa {
 	uint8_t hdr[MG_IPSEC_ETH_LEN + sizeof(struct rte_ipv4_hdr)];
 	int outbound;
 	int tunnel;
-	uint32_t first_seq;            // ESP sequence number of the first/last packet received for this SA
+	uint32_t spi;
+	uint32_t first_seq;           // ESP sequence number of the first/last packet received for this SA
 	uint32_t last_seq;
 	uint64_t seen;                 // packets received for this SA (before replay check and decryption)
 };
@@ -96,8 +97,10 @@ int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket) {
 // IPv4 addresses and SPI in host byte order. MACs are only used for outbound tunnel SAs:
 // the tunnel template contains Ethernet + outer IPv4 header, so encrypted packets are ready to send.
 // replay_win = 0 disables the anti-replay check (inbound only).
+// esn: extended (64 bit) sequence numbers, RFC 4303: the packets still carry the low 32 bits only, the high
+// 32 bits are part of the authenticated data.
 struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
-		const uint8_t* key, uint32_t key_len, uint32_t replay_win,
+		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket) {
 	if (mg_cdev_id < 0) {
 		printf("[ipsec] mg_ipsec_init() has not been called\n");
@@ -109,6 +112,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	}
 	s->outbound = outbound;
 	s->tunnel = tunnel;
+	s->spi = spi;
 
 	struct rte_crypto_sym_xform xf = {
 		.type = RTE_CRYPTO_SYM_XFORM_AEAD,
@@ -119,7 +123,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 			.key = { .data = key, .length = key_len },
 			.iv = { .offset = 0, .length = MG_IPSEC_GCM_IV_LEN }, // offset is unused with CPU crypto
 			.digest_length = MG_IPSEC_GCM_ICV_LEN,
-			.aad_length = MG_IPSEC_GCM_AAD_LEN,
+			.aad_length = MG_IPSEC_GCM_AAD_LEN + (esn ? 4 : 0),
 		},
 	};
 
@@ -131,6 +135,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	prm.ipsec_xform.proto = RTE_SECURITY_IPSEC_SA_PROTO_ESP;
 	prm.ipsec_xform.mode = tunnel ? RTE_SECURITY_IPSEC_SA_MODE_TUNNEL : RTE_SECURITY_IPSEC_SA_MODE_TRANSPORT;
 	prm.ipsec_xform.replay_win_sz = outbound ? 0 : replay_win;
+	prm.ipsec_xform.options.esn = esn != 0;
 	prm.crypto_xform = &xf;
 
 	if (tunnel) {
@@ -251,6 +256,8 @@ uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint
 }
 
 // Complete receive step: rx burst, SA lookup by SPI (sas[spi - spi_base]), decrypt, count, free.
+// With spi_base = 0 the SPIs are arbitrary (e.g. negotiated by IKE): sas is then a hash table with nb_sa slots
+// (a power of two, at least one slot empty), indexed by the low bits of the SPI with linear probing.
 // Returns the number of received packets.
 uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
 		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st) {
@@ -277,7 +284,14 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 			continue;
 		}
 		struct rte_esp_hdr* esph = (struct rte_esp_hdr*) ((uint8_t*) ip + rte_ipv4_hdr_len(ip));
-		uint32_t sa_idx = rte_be_to_cpu_32(esph->spi) - spi_base;
+		uint32_t spi = rte_be_to_cpu_32(esph->spi);
+		uint32_t sa_idx = spi - spi_base;
+		if (!spi_base) {
+			sa_idx = spi & (nb_sa - 1);
+			while (sas[sa_idx] && sas[sa_idx]->spi != spi) {
+				sa_idx = (sa_idx + 1) & (nb_sa - 1);
+			}
+		}
 		if (sa_idx >= nb_sa || !sas[sa_idx]) {
 			st->unknown_spi++;
 			continue;

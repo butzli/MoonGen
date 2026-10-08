@@ -33,6 +33,8 @@ function configure(parser)
 	parser:option("--tunnel-local", "Own outer IP: source of the first SA sent (incremented per SA), destination of the SAs received."):default("192.168.0.1")
 	parser:option("--tunnel-remote", "Outer IP of the peer: destination of the SAs sent, source of the first SA received (incremented per SA)."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
+	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --tx-cores, --sas, --key, --spi-base and the addresses.")
+	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
 	parser:option("--burst", "Burst size of the senders."):default(64):convert(tonumber)
@@ -48,20 +50,27 @@ end
 function master(args)
 	if args.mode ~= "tunnel" and args.mode ~= "transport" then log:fatal("Mode must be tunnel or transport") end
 	args.key = args.key or ipsec.testKey(args.bits)
+	local txSas, rxSas
+	if args.sa_file then
+		txSas, rxSas = ipsec.loadSaFile(args.sa_file, "out"), ipsec.loadSaFile(args.sa_file, "in")
+		args.tx_cores, args.sas = #txSas, #rxSas
+	end
 	args.sas = args.sas or args.tx_cores
-	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true}
+	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames
+	if not args.rss then ipsec.isolate(args.dev) end
+	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rss and args.rx_cores or nil, rxDescs = args.rx_descs, disableRxOffloads = true}
 	device.waitForLinks()
 	ipsec.init(args.tx_cores + args.rx_cores * args.sas + 16)
-	for i = 0, args.rss and -1 or args.sas - 1 do
-		ipsec.steerSpi(dev:getRxQueue(i % args.rx_cores), args.spi_base + i)
-	end
 	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
 	local tx, rx = {}, {}
 	for k, v in pairs(args) do
 		tx[k], rx[k] = v, v
 	end
-	tx.cores, tx.tunnel_src, tx.tunnel_dst = args.tx_cores, args.tunnel_local, args.tunnel_remote
-	rx.cores, rx.tunnel_src, rx.tunnel_dst, rx.burst = args.rx_cores, args.tunnel_remote, args.tunnel_local, args.rx_burst
+	tx.cores, tx.tunnel_src, tx.tunnel_dst, tx.saList = args.tx_cores, args.tunnel_local, args.tunnel_remote, txSas
+	rx.cores, rx.tunnel_src, rx.tunnel_dst, rx.burst, rx.saList = args.rx_cores, args.tunnel_remote, args.tunnel_local, args.rx_burst, rxSas
+	for i = 0, args.rss and -1 or args.sas - 1 do
+		ipsec.steerSpi(dev:getRxQueue(i % args.rx_cores), rxSa(rx, i).spi)
+	end
 	-- the two nodes do not start at the same instant: the senders wait tx_delay before they start and the
 	-- receivers run rx_linger longer than the senders, so that neither end of the run shows up as loss
 	txSetup(tx)

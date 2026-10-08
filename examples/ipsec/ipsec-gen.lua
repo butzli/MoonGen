@@ -22,6 +22,8 @@ function configure(parser)
 	parser:option("--tunnel-src", "Outer source IP of the first SA (incremented per SA)."):default("192.168.0.1")
 	parser:option("--tunnel-dst", "Outer destination IP."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
+	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --cores, --key, --spi-base and the addresses.")
+	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
@@ -32,6 +34,12 @@ end
 function master(args)
 	if args.mode ~= "tunnel" and args.mode ~= "transport" then log:fatal("Mode must be tunnel or transport") end
 	args.key = args.key or ipsec.testKey(args.bits)
+	if args.sa_file then
+		args.saList = ipsec.loadSaFile(args.sa_file, "out")
+		args.cores = #args.saList
+	end
+	-- nothing is received here: all incoming frames stay with the kernel (ARP, IKE)
+	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores}
 	device.waitForLinks()
 	ipsec.init(args.cores + 16)
@@ -59,25 +67,38 @@ function txSetup(args)
 	if args.time > 0 then mg.setRuntime(args.tx_delay + args.ramp + args.time) end
 end
 
+--- SA of a core: the entry of the SA file or, without one, the SA derived from the options.
+local function coreSa(args, core)
+	return args.saList and args.saList[core + 1] or {
+		spi = args.spi_base + core,
+		key = args.key,
+		src = parseIP4Address(args.tunnel_src) + core,
+		dst = args.tunnel_dst,
+		esn = args.esn,
+	}
+end
+
 --- Waits for the transmit tasks and prints their results (also used by ipsec-transceiver.lua).
 function txSummary(tasks, args)
 	local fails, sent, rate = 0, 0, 0
 	for i = 0, args.cores - 1 do
 		local f, s, r, lag, lagAt, phases = tasks[i]:wait()
-		log:info("Core %d: SPI %d, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, args.spi_base + i, s, lag * 1e3, lagAt, phases)
+		log:info("Core %d: SPI %d, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, coreSa(args, i).spi, s, lag * 1e3, lagAt, phases)
 		fails, sent, rate = fails + f, sent + s, rate + r
 	end
 	log:info("Encryption failures: %d, packets sent: %d, rate %.2f Mpps", fails, sent, rate)
 end
 
 function txSlave(queue, core, args)
+	local entry = coreSa(args, core)
 	local sa = ipsec.createSa{
 		dir = "out",
 		mode = args.mode,
-		spi = args.spi_base + core,
-		key = args.key,
-		src = parseIP4Address(args.tunnel_src) + core,
-		dst = args.tunnel_dst,
+		spi = entry.spi,
+		key = entry.key,
+		src = entry.src,
+		dst = entry.dst,
+		esn = entry.esn,
 		srcMac = queue.dev:getMacString(),
 		dstMac = args.dst_mac,
 		socket = select(2, mg.getCore()),
@@ -90,8 +111,8 @@ function txSlave(queue, core, args)
 	pkt:fill{
 		ethSrc = queue,
 		ethDst = args.dst_mac,
-		ip4Src = parseIP4Address("10.0.0.1") + core,
-		ip4Dst = "10.1.0.1",
+		ip4Src = entry.innerSrc or parseIP4Address("10.0.0.1") + core,
+		ip4Dst = entry.innerDst or "10.1.0.1",
 		udpSrc = 1234,
 		udpDst = 5678,
 		pktLength = args.size,
@@ -143,7 +164,7 @@ function txSlave(queue, core, args)
 		if n > 0 then
 			if first then
 				first = false
-				log:info("Core %d: SPI %d, inner frame %d B -> ESP frame %d B", core, args.spi_base + core, args.size, bufs.array[0].pkt_len)
+				log:info("Core %d: SPI %d, inner frame %d B -> ESP frame %d B", core, entry.spi, args.size, bufs.array[0].pkt_len)
 			end
 			queue:sendN(bufs, n)
 			sent = sent + n
