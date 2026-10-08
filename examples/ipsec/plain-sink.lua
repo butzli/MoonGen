@@ -28,7 +28,7 @@ end
 function master(args)
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.rxDev) end
-	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.rss and args.cores or nil, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
+	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
 	for i = 0, args.rss and -1 or args.flows - 1 do
 		ipsec.steerSrcIp(rxDev:getRxQueue(i % args.cores), parseIP4Address(args.src) + i)

@@ -43,7 +43,7 @@ function master(args)
 	end
 	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.rxDev) end
-	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.rss and args.cores or nil, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
+	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
 	ipsec.init(args.cores * args.sas + 16)
 	for i = 0, args.rss and -1 or args.sas - 1 do

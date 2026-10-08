@@ -58,7 +58,7 @@ function master(args)
 	args.sas = args.sas or args.tx_cores
 	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
-	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rss and args.rx_cores or nil, rxDescs = args.rx_descs, disableRxOffloads = true}
+	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true}
 	device.waitForLinks()
 	ipsec.init(args.tx_cores + args.rx_cores * args.sas + 16)
 	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
