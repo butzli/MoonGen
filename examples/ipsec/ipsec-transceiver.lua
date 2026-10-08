@@ -35,7 +35,8 @@ function configure(parser)
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
-	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
+	parser:option("--burst", "Burst size of the senders."):default(64):convert(tonumber)
+	parser:option("--rx-burst", "Burst size of the receivers."):default(64):convert(tonumber)
 	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
 	parser:flag("--rss", "Distribute the SAs received by RSS hash of the outer IPs instead of one rte_flow rule per SPI.")
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
@@ -60,7 +61,7 @@ function master(args)
 		tx[k], rx[k] = v, v
 	end
 	tx.cores, tx.tunnel_src, tx.tunnel_dst = args.tx_cores, args.tunnel_local, args.tunnel_remote
-	rx.cores, rx.tunnel_src, rx.tunnel_dst = args.rx_cores, args.tunnel_remote, args.tunnel_local
+	rx.cores, rx.tunnel_src, rx.tunnel_dst, rx.burst = args.rx_cores, args.tunnel_remote, args.tunnel_local, args.rx_burst
 	-- the two nodes do not start at the same instant: the senders wait tx_delay before they start and the
 	-- receivers run rx_linger longer than the senders, so that neither end of the run shows up as loss
 	txSetup(tx)
