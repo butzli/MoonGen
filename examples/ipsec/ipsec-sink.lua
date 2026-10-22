@@ -2,7 +2,9 @@
 --- One rte_flow rule per SA steers SPI spiBase + i to RX queue i mod cores, so every SA is always handled
 --- by the same core (the anti-replay state is never shared) and the SAs are spread evenly over the cores.
 --- With --rss the NIC distributes by RSS hash of the outer IPs instead (uneven for few SAs).
---- Every core decrypts, authenticates and counts the packets of its queue.
+--- Every core decrypts, authenticates and counts the packets of its queue and checks the generator payload of the
+--- decrypted packets (ipsec-sw.lua): per flow, gaps and reordering end to end, also of traffic that a device in
+--- between has encrypted itself (whose ESP sequence numbers then only cover the way from the device to here).
 --- ./build/MoonGen examples/ipsec/ipsec-sink.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <rxDev> -c 4 --sas 4
 local mg     = require "moongen"
 local memory = require "memory"
@@ -65,15 +67,17 @@ end
 
 --- Waits for the receive tasks and prints their results (also used by ipsec-transceiver.lua).
 function rxSummary(tasks, args, rxDev)
-	local total = {0, 0, 0, 0, 0, 0, 0}
+	local total, flows = {0, 0, 0, 0, 0, 0, 0}, {}
 	for i = 0, args.cores - 1 do
-		local res, gap, gapAt = tasks[i]:wait()
+		local res, gap, gapAt, fl = tasks[i]:wait()
 		for k, v in ipairs(res) do
 			total[k] = total[k] + v
 		end
+		flows[i] = fl
 		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
+	ipsec.flowSummary(flows, args.cores, "Payload: ")
 	local nic = rxDev:getStats()
 	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
@@ -115,6 +119,7 @@ function rxSlave(queue, core, args)
 		spiBase = 0
 	end
 	local st = ipsec.newRxStats()
+	local flows = ipsec.newFlows()
 	local bufs = memory.bufArray(args.burst)
 	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
 	-- ipsec-transceiver.lua keeps receiving for rx_linger seconds after its own senders have stopped
@@ -124,7 +129,7 @@ function rxSlave(queue, core, args)
 	local last = mg.getTime()
 	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
 	while mg.running(linger) do
-		ipsec.rxDecrypt(queue, bufs, saTable, numSas, spiBase, st)
+		ipsec.rxDecrypt(queue, bufs, saTable, numSas, spiBase, st, flows, args.mode)
 		local now = mg.getTime()
 		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
 		last = now
@@ -147,5 +152,5 @@ function rxSlave(queue, core, args)
 		end
 	end
 	res[#FIELDS + 1] = missing
-	return res, maxGap, maxGapAt
+	return res, maxGap, maxGapAt, ipsec.flowResults(flows)
 end

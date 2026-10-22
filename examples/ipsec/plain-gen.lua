@@ -1,7 +1,9 @@
 --- Cleartext UDP traffic generator, counterpart of plain-sink.lua and cleartext twin of ipsec-gen.lua.
 --- One TX queue, one core and one flow per core; flow i uses source IP src + i (like the outer source IP
 --- of SA i in ipsec-gen.lua), so the receiver's RSS spreads the flows over its queues.
---- The UDP payload starts with a magic number (uint32), the flow id (uint32) and a sequence number (uint64).
+--- The UDP payload is the generator payload of ipsec-sw.lua (magic, flow, sequence number per flow), the same as the
+--- inner payload of ipsec-gen.lua, so that ipsec-sink.lua can check this traffic after a device in between has
+--- encrypted it.
 --- The transmit tasks are also used by plain-transceiver.lua.
 --- ./build/MoonGen examples/ipsec/plain-gen.lua <txDev> -c 4 -s 60 -t 10
 local mg     = require "moongen"
@@ -9,15 +11,13 @@ local memory = require "memory"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
-local ipsec  = require "ipsec-sw" -- only for the flow isolation
-
-local MAGIC = 0x504c4149 -- "PLAI"
+local ipsec  = require "ipsec-sw" -- flow isolation and generator payload
 
 function configure(parser)
 	parser:description("Generates cleartext UDP traffic with per-flow sequence numbers, one flow per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
 	parser:option("-c --cores", "Number of TX cores (= queues = flows)."):default(1):convert(tonumber)
-	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 58."):default(60):convert(tonumber)
+	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60."):default(60):convert(tonumber)
 	parser:option("--src", "Source IP of the first flow (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC."):default("ff:ff:ff:ff:ff:ff")
@@ -28,7 +28,7 @@ function configure(parser)
 end
 
 function master(args)
-	if args.size < 58 then log:fatal("Packet size must be at least 58") end
+	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
 	-- nothing is received here: all incoming frames stay with the kernel (ARP)
 	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores}
@@ -75,7 +75,7 @@ function txSlave(queue, flow, args)
 		}
 		pkt.ip4:calculateChecksum()
 		pkt.udp:setChecksum(0)
-		pkt.payload.uint32[0], pkt.payload.uint32[1] = MAGIC, flow
+		ipsec.fillPayload(pkt, flow)
 	end}
 	local bufs = mem:bufArray(args.burst)
 	local seq = 0
@@ -117,7 +117,7 @@ function txSlave(queue, flow, args)
 		end
 		bufs:alloc(args.size)
 		for _, buf in ipairs(bufs) do
-			buf:getUdpPacket().payload.uint64[1] = seq
+			ipsec.setPayloadSeq(buf:getUdpPacket(), seq)
 			seq = seq + 1
 		end
 		queue:send(bufs)

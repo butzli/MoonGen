@@ -4,9 +4,8 @@
 --- then runs ipsec-transceiver.lua.
 --- Sending: one TX queue, one core and one flow per TX core; flow i goes from src + i to dst.
 --- Receiving: one rte_flow rule per flow steers source address rxSrc + i to RX queue i mod rxCores (with --rss:
---- RSS hash instead). Packets without the payload of plain-gen.lua, such as the traffic of ipsec-gen.lua after the
---- device has decrypted it, are counted per queue as other packets; with no more flows than queues, that is the
---- count of one flow each.
+--- RSS hash instead). Both sides carry the same generator payload (ipsec-sw.lua), so the receivers also check the
+--- traffic of ipsec-gen.lua after the device has decrypted it; packets without it are counted per queue as other.
 --- Like ipsec-transceiver.lua, only the receive offloads are switched off.
 --- Node A: ./build/MoonGen examples/ipsec/plain-transceiver.lua <dev> --tx-cores 4 --rx-cores 4
 --- Node B: the same with --src 192.168.1.1 --dst 192.168.0.1 --rx-src 192.168.0.1
@@ -15,7 +14,7 @@ local mg     = require "moongen"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
-local ipsec  = require "ipsec-sw" -- only for the flow rules and the isolated mode
+local ipsec  = require "ipsec-sw" -- flow rules, isolated mode and generator payload
 -- txSlave and txSummary come from plain-gen.lua, rxSlave and rxSummary from plain-sink.lua;
 -- configure and master of these two files are replaced by the ones below
 require "plain-gen"
@@ -27,7 +26,7 @@ function configure(parser)
 	parser:option("--tx-cores", "Number of TX cores (= TX queues = flows sent)."):default(1):convert(tonumber)
 	parser:option("--rx-cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
 	parser:option("-n --flows", "Number of flows the peer sends (= its --tx-cores), default: own --tx-cores."):convert(tonumber)
-	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 58."):default(60):convert(tonumber)
+	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60."):default(60):convert(tonumber)
 	parser:option("--src", "Source IP of the first flow sent (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP of the flows sent."):default("192.168.1.1")
 	parser:option("--rx-src", "Source IP of the first flow received (incremented per flow)."):default("192.168.1.1")
@@ -44,7 +43,7 @@ function configure(parser)
 end
 
 function master(args)
-	if args.size < 58 then log:fatal("Packet size must be at least 58") end
+	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
 	args.flows = args.flows or args.tx_cores
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end

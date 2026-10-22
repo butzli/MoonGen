@@ -30,10 +30,24 @@ ffi.cdef[[
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
 	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
-		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* fails);
+		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails);
 	uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok);
+
+	struct mg_flow {
+		uint64_t rx;
+		uint64_t lost;
+		uint64_t late;
+		uint64_t exp;
+	};
+	struct mg_flows {
+		uint64_t other;
+		struct mg_flow f[4096];
+	};
+
 	uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
-		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st);
+		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st, struct mg_flows* fl,
+		uint16_t l3_off);
+	uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl);
 ]]
 
 local mod = {}
@@ -125,9 +139,77 @@ function mod.createSa(args)
 end
 
 --- Encrypt bufs[0..n-1] in place, optionally re-filling them from a packet template first.
+--- @param seq optional uint64_t[1]: the template holds the generator payload (mod.fillPayload) and every packet
+---   gets the next sequence number from seq[0]
 --- @return number of encrypted packets at the start of bufs.array (failed ones are freed)
-function mod.encrypt(sa, bufs, n, tmpl, tmplLen, fails)
-	return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, fails)
+function mod.encrypt(sa, bufs, n, tmpl, tmplLen, fails, seq)
+	return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, seq, fails)
+end
+
+--- Payload of the generated packets, the UDP payload of the (inner) packet with and without ESP, so that
+--- either receiver checks the traffic of either generator, also after a device in between has en- or decrypted it:
+--- magic (uint32) | send time (uint32, reserved, 0) | sequence number of the flow (uint64) | flow (uint16)
+--- = 18 bytes, which fills a 60 byte frame (see struct mg_payload in src/ipsec-sw.c).
+mod.PAYLOAD_MAGIC = 0x504c4149 -- "PLAI"
+mod.MIN_FRAME = 60
+mod.MAX_FLOWS = 4096
+
+--- Write the constant part of the payload (all but the sequence number) into a UDP packet.
+function mod.fillPayload(udpPkt, flow)
+	local p = udpPkt.payload
+	p.uint32[0], p.uint32[1], p.uint16[8] = mod.PAYLOAD_MAGIC, 0, flow
+end
+
+--- Write the sequence number into the payload of a UDP packet.
+function mod.setPayloadSeq(udpPkt, seq)
+	udpPkt.payload.uint64[1] = seq
+end
+
+--- Per-flow state of one receive queue for mod.rxDecrypt and mod.plainRx.
+function mod.newFlows()
+	return ffi.new("struct mg_flows")
+end
+
+--- The flows seen by one receive queue as a plain table (to be returned by a task).
+--- @return { other = n, flows = { [id] = { rx, lost, late } } }
+function mod.flowResults(fl)
+	local res = { other = tonumber(fl.other), flows = {} }
+	for id = 0, mod.MAX_FLOWS - 1 do
+		local f = fl.f[id]
+		if f.rx > 0 then
+			res.flows[id] = { rx = tonumber(f.rx), lost = tonumber(f.lost), late = tonumber(f.late) }
+		end
+	end
+	return res
+end
+
+--- Merge and print the flow results of all receive queues (res[q] = mod.flowResults of queue q):
+--- one line per flow with the queue(s) it arrived on and one line with the totals, both starting with prefix.
+--- @return totals { flows, rx, lost, late, split, other }
+function mod.flowSummary(res, queues, prefix)
+	local flows, ids, other = {}, {}, 0
+	for q = 0, queues - 1 do
+		other = other + res[q].other
+		for id, f in pairs(res[q].flows) do
+			if not flows[id] then
+				flows[id], ids[#ids + 1] = { rx = 0, lost = 0, late = 0, queues = {} }, id
+			end
+			local e = flows[id]
+			e.rx, e.lost, e.late = e.rx + f.rx, e.lost + f.lost, e.late + f.late
+			e.queues[#e.queues + 1] = q
+		end
+	end
+	table.sort(ids)
+	local total = { flows = #ids, rx = 0, lost = 0, late = 0, split = 0, other = other }
+	for _, id in ipairs(ids) do
+		local e = flows[id]
+		log:info("%sFlow %d: received %d, missing %d, late/duplicate %d, queue(s) %s", prefix, id, e.rx, e.lost, e.late, table.concat(e.queues, ","))
+		total.rx, total.lost, total.late = total.rx + e.rx, total.lost + e.lost, total.late + e.late
+		if #e.queues > 1 then total.split = total.split + 1 end
+	end
+	log:info("%sTotal: flows %d, received %d, missing %d, late/duplicate %d, flows on more than one queue %d, other packets %d",
+		prefix, total.flows, total.rx, total.lost, total.late, total.split, total.other)
+	return total
 end
 
 --- Read a list of SAs that were set up elsewhere, e.g. negotiated by an IKE daemon.
@@ -256,9 +338,16 @@ function mod.newRxStats()
 	return ffi.new("struct mg_ipsec_rx_stats")
 end
 
---- Receive, decrypt, count and free one burst.
-function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats)
-	return C.mg_ipsec_rx_decrypt(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, saTable, numSas, spiBase, stats)
+--- Receive, decrypt, count and free one burst; with flows (mod.newFlows) also check the payload of the decrypted
+--- packets, whose inner IPv4 header starts at offset 0 in tunnel mode and after the Ethernet header in transport mode.
+function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats, flows, mode)
+	return C.mg_ipsec_rx_decrypt(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, saTable, numSas, spiBase, stats, flows,
+		mode == "transport" and 14 or 0)
+end
+
+--- Receive one burst of cleartext packets, check their payload into flows (mod.newFlows) and free them.
+function mod.plainRx(rxQueue, bufs, flows)
+	return C.mg_plain_rx(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, flows)
 end
 
 return mod

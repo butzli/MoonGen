@@ -15,6 +15,7 @@
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_udp.h>
 #include <rte_esp.h>
 #include <rte_cryptodev.h>
 #include <rte_security.h>
@@ -47,8 +48,94 @@ struct mg_ipsec_rx_stats {
 	uint64_t auth_fails;    // ICV check failed or invalid ESP trailer
 };
 
+// Payload of the generated packets: the UDP payload of the (inner) packet, the same with and without ESP, so that
+// either receiver checks the traffic of either generator, also after a device in between has en- or decrypted it.
+// magic | send time (reserved, 0) | sequence number of the flow | flow = 18 bytes, which fills a 60 byte frame.
+// Host byte order; the fields are in this order so that each one is naturally aligned within the payload.
+#define MG_PAYLOAD_MAGIC 0x504c4149 // "PLAI"
+#define MG_FLOWS_MAX     4096       // flow ids above are counted as other packets
+struct __rte_packed_begin mg_payload {
+	uint32_t magic;
+	uint32_t time;
+	uint64_t seq;
+	uint16_t flow;
+} __rte_packed_end;
+// offset of the payload in a frame built from a packet template: Ethernet, IPv4 without options, UDP
+#define MG_PAYLOAD_OFF (MG_IPSEC_ETH_LEN + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr))
+
+// Per-flow state of one receive queue: rx = 0 means the flow has not been seen on this queue yet.
+struct mg_flow {
+	uint64_t rx;   // packets received
+	uint64_t lost; // sequence numbers skipped (everything before the first packet counts as skipped)
+	uint64_t late; // sequence numbers from the past: reordered or duplicated
+	uint64_t exp;  // next expected sequence number
+};
+struct mg_flows {
+	uint64_t other; // packets without a valid payload
+	struct mg_flow f[MG_FLOWS_MAX];
+};
+
 static int mg_cdev_id = -1;
 static struct rte_mempool* mg_sess_pool;
+
+// Check the payload of n packets whose IPv4 header starts at l3_off: count them per flow and find gaps.
+// Fast path for IPv4 without options carrying UDP, which all generated packets are; anything else takes the
+// general path or is counted as other.
+static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n, uint16_t l3_off) {
+	const uint32_t fast_len = l3_off + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(struct mg_payload);
+	for (uint16_t i = 0; i < n; i++) {
+		struct rte_mbuf* m = mb[i];
+		const uint8_t* ip = rte_pktmbuf_mtod_offset(m, const uint8_t*, l3_off);
+		const struct mg_payload* p;
+		if (likely(m->data_len >= fast_len && ip[0] == RTE_IPV4_VHL_DEF && ip[9] == IPPROTO_UDP)) {
+			p = (const struct mg_payload*) (ip + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr));
+		} else {
+			uint32_t off = l3_off + sizeof(struct rte_ipv4_hdr);
+			if (m->data_len < off || (ip[0] >> 4) != 4 || ip[9] != IPPROTO_UDP) {
+				fl->other++;
+				continue;
+			}
+			off = l3_off + (ip[0] & 0xf) * 4 + sizeof(struct rte_udp_hdr);
+			if (m->data_len < off + sizeof(struct mg_payload)) {
+				fl->other++;
+				continue;
+			}
+			p = rte_pktmbuf_mtod_offset(m, const struct mg_payload*, off);
+		}
+		uint16_t id = p->flow;
+		if (unlikely(p->magic != MG_PAYLOAD_MAGIC || id >= MG_FLOWS_MAX)) {
+			fl->other++;
+			continue;
+		}
+		struct mg_flow* f = &fl->f[id];
+		uint64_t seq = p->seq;
+		if (unlikely(!f->rx)) {
+			// first packet of this flow on this queue: everything before it counts as missing
+			f->lost = seq;
+			f->exp = seq;
+		}
+		f->rx++;
+		if (likely(seq >= f->exp)) {
+			f->lost += seq - f->exp;
+			f->exp = seq + 1;
+		} else {
+			// sequence number from the past: reordered or duplicated; it was counted as missing before
+			f->late++;
+		}
+	}
+}
+
+// Complete receive step of the cleartext receiver: rx burst, check the payload, free.
+// Returns the number of received packets.
+uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl) {
+	uint16_t n = rte_eth_rx_burst(port, queue, mb, burst);
+	if (n == 0) {
+		return 0;
+	}
+	mg_flows_check(fl, mb, n, MG_IPSEC_ETH_LEN);
+	rte_pktmbuf_free_bulk(mb, n);
+	return n;
+}
 
 // Configure and start the crypto device (e.g. "crypto_aesni_gcm0", created via --vdev).
 // Must be called once from the main task before any SA is created.
@@ -207,10 +294,12 @@ void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s) {
 
 // Encrypt a burst of Ethernet/IPv4 packets in place.
 // If tmpl is not NULL, it is copied into every mbuf first (the previous content was overwritten
-// by the last in-place encryption of that mbuf, so pre-filled mempools do not survive).
+// by the last in-place encryption of that mbuf, so pre-filled mempools do not survive). If seq is not NULL
+// either, the template holds the generator payload (struct mg_payload) and every packet gets the next
+// sequence number of the flow from *seq.
 // Successfully encrypted packets are at mb[0..ret-1] and ready to send, failed ones are freed.
 uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
-		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* fails) {
+		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails) {
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf* m = mb[i];
 		if (tmpl) {
@@ -223,6 +312,15 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 		m->l3_len = sizeof(struct rte_ipv4_hdr);
 		// outer (tunnel) or modified (transport) IPv4 header checksum is computed by the NIC
 		m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
+	}
+	// in a pass of its own: inside the loop above, it slows the copy loop down measurably
+	if (tmpl && seq && tmpl_len >= MG_PAYLOAD_OFF + sizeof(struct mg_payload)) {
+		// counted in a local: through the pointer, which may alias the payload, *seq is loaded and stored per packet
+		uint64_t q = *seq;
+		for (uint16_t i = 0; i < n; i++) {
+			rte_pktmbuf_mtod_offset(mb[i], struct mg_payload*, MG_PAYLOAD_OFF)->seq = q++;
+		}
+		*seq = q;
 	}
 	uint16_t k = rte_ipsec_pkt_cpu_prepare(&s->ss, mb, n);
 	k = rte_ipsec_pkt_process(&s->ss, mb, k);
@@ -255,12 +353,15 @@ uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint
 	return s->seen;
 }
 
-// Complete receive step: rx burst, SA lookup by SPI (sas[spi - spi_base]), decrypt, count, free.
+// Complete receive step: rx burst, SA lookup by SPI (sas[spi - spi_base]), decrypt, count, check the payload of
+// the packets (if fl is not NULL; IPv4 header of a decrypted packet at l3_off: 0 in tunnel mode, where rte_ipsec
+// removes the outer headers, 14 in transport mode, where it keeps the Ethernet header), free.
 // With spi_base = 0 the SPIs are arbitrary (e.g. negotiated by IKE): sas is then a hash table with nb_sa slots
 // (a power of two, at least one slot empty), indexed by the low bits of the SPI with linear probing.
 // Returns the number of received packets.
 uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
-		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st) {
+		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st, struct mg_flows* fl,
+		uint16_t l3_off) {
 	if (burst > MG_IPSEC_MAX_BURST) {
 		burst = MG_IPSEC_MAX_BURST;
 	}
@@ -324,6 +425,11 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		st->prepare_drops += g - prep_ok;
 		st->auth_fails += prep_ok - ok;
 		st->ok_pkts += ok;
+	}
+	// the payload check runs in a pass of its own over the whole burst: inside the loop above, its mere call slows
+	// that loop down by several percent; packets that were not decrypted have no valid payload there and count as other
+	if (fl) {
+		mg_flows_check(fl, mb, n, l3_off);
 	}
 	rte_pktmbuf_free_bulk(mb, n);
 	return n;

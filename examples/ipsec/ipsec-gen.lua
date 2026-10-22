@@ -1,6 +1,8 @@
 --- ESP (AES-GCM) traffic generator, counterpart of ipsec-sink.lua.
 --- One TX queue, one core and one outbound SA per core; SA i uses SPI spiBase + i
 --- and outer source IP tunnelSrc + i, so the receiver's RSS spreads the SAs over its queues.
+--- The inner UDP payload is the generator payload of ipsec-sw.lua (flow i = SA i, sequence number per flow), so
+--- that plain-sink.lua can check the traffic after a device in between has decrypted it.
 --- ./build/MoonGen examples/ipsec/ipsec-gen.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <txDev> -c 4 -s 60
 local mg     = require "moongen"
 local memory = require "memory"
@@ -14,7 +16,7 @@ function configure(parser)
 	parser:description("Generates ESP/AES-GCM encrypted UDP traffic (rte_ipsec + CPU crypto), one SA per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
 	parser:option("-c --cores", "Number of TX cores (= queues = SAs)."):default(1):convert(tonumber)
-	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption."):default(60):convert(tonumber)
+	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption, at least 60."):default(60):convert(tonumber)
 	parser:option("-b --bits", "AES key length (128 or 256), ignored if --key is given."):default(256):convert(tonumber)
 	parser:option("-k --key", "AES-GCM key + 4 byte salt as hex (RFC 4106 layout).")
 	parser:option("-m --mode", "tunnel or transport."):default("tunnel")
@@ -60,6 +62,7 @@ end
 --- Fixes the start of the senders and the run time; to be called once before the transmit tasks are started
 --- (also used by ipsec-transceiver.lua).
 function txSetup(args)
+	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
 	args.txStart = mg.getTime() + args.tx_delay
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold
 	-- caches and, in ipsec-transceiver.lua, while the transmit tasks of its own process are starting
@@ -119,10 +122,13 @@ function txSlave(queue, core, args)
 	}
 	pkt.ip4:calculateChecksum()
 	pkt.udp:setChecksum(0)
+	ipsec.fillPayload(pkt, core)
 	local tmpl = ffi.new("uint8_t[?]", args.size)
 	ffi.copy(tmpl, bufs[1]:getData(), args.size)
 	bufs:freeAll()
 	local fails = ffi.new("uint64_t[1]")
+	-- sequence number of the flow in the inner payload, written into every packet by ipsec.encrypt
+	local seq = ffi.new("uint64_t[1]")
 	local first = true
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
@@ -160,7 +166,7 @@ function txSlave(queue, core, args)
 			nextSend = math.max(nextSend, now - 0.01) + interval
 		end
 		bufs:alloc(args.size)
-		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails)
+		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails, seq)
 		if n > 0 then
 			if first then
 				first = false
