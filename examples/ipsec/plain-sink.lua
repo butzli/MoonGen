@@ -2,6 +2,8 @@
 --- One rte_flow rule per flow steers source IP src + i to RX queue i mod cores, like ipsec-sink.lua does
 --- per SPI; with --rss the NIC distributes by RSS hash instead (uneven for few flows).
 --- Reports per flow which queue(s) it arrived on and whether its sequence numbers are complete and in order.
+--- Packets without the payload of plain-gen.lua, such as the traffic of ipsec-gen.lua after a device in between has
+--- decrypted it, are counted per queue as other packets. The receive tasks are also used by plain-transceiver.lua.
 --- ./build/MoonGen examples/ipsec/plain-sink.lua <rxDev> -c 4 -n 4 -t 25
 local mg     = require "moongen"
 local memory = require "memory"
@@ -36,7 +38,7 @@ function master(args)
 	if args.time > 0 then mg.setRuntime(args.time) end
 	local tasks = {}
 	for i = 0, args.cores - 1 do
-		tasks[i] = mg.startTask("rxSlave", rxDev:getRxQueue(i), args.burst)
+		tasks[i] = mg.startTask("rxSlave", rxDev:getRxQueue(i), i, args)
 	end
 	local ctr = stats:newDevRxCounter(rxDev, "plain")
 	while mg.running() do
@@ -44,12 +46,19 @@ function master(args)
 		mg.sleepMillisIdle(10)
 	end
 	ctr:finalize()
+	rxSummary(tasks, args, rxDev)
+end
+
+--- Waits for the receive tasks and prints their results (also used by plain-transceiver.lua).
+function rxSummary(tasks, args, rxDev)
 	-- merge the per-queue results: totals per flow and the queues it was seen on
 	local flows, ids, other = {}, {}, 0
 	for q = 0, args.cores - 1 do
 		local res = tasks[q]:wait()
 		other = other + res.other
 		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", q, res.maxGap * 1e3, res.maxGapAt)
+		-- with one flow rule per source address and no more flows than queues, this is the count of one flow
+		log:info("Queue %d: other packets %d", q, res.other)
 		for id, f in pairs(res.flows) do
 			if not flows[id] then
 				flows[id], ids[#ids + 1] = {rx = 0, lost = 0, late = 0, queues = {}}, id
@@ -74,14 +83,16 @@ function master(args)
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
 end
 
-function rxSlave(queue, burst)
-	local bufs = memory.bufArray(burst)
+function rxSlave(queue, core, args)
+	local bufs = memory.bufArray(args.burst)
 	local flows, other = {}, 0
+	-- plain-transceiver.lua keeps receiving for rx_linger seconds after its own senders have stopped
+	local linger = (args.rx_linger or 0) * 1000
 	-- diagnosis: longest time between two receive calls, i.e. the longest stall of this task; the time given is
-	-- in seconds after the first second of this task
+	-- in seconds after the start of the senders (plain-transceiver.lua) or after the first second of this task
 	local last = mg.getTime()
-	local ref, maxGap, maxGapAt = last + 1, 0, 0
-	while mg.running() do
+	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
+	while mg.running(linger) do
 		local n = queue:tryRecv(bufs, 0)
 		local now = mg.getTime()
 		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end

@@ -2,6 +2,7 @@
 --- One TX queue, one core and one flow per core; flow i uses source IP src + i (like the outer source IP
 --- of SA i in ipsec-gen.lua), so the receiver's RSS spreads the flows over its queues.
 --- The UDP payload starts with a magic number (uint32), the flow id (uint32) and a sequence number (uint64).
+--- The transmit tasks are also used by plain-transceiver.lua.
 --- ./build/MoonGen examples/ipsec/plain-gen.lua <txDev> -c 4 -s 60 -t 10
 local mg     = require "moongen"
 local memory = require "memory"
@@ -45,6 +46,11 @@ function master(args)
 		mg.sleepMillisIdle(10)
 	end
 	ctr:finalize()
+	txSummary(tasks, args)
+end
+
+--- Waits for the transmit tasks and prints their results (also used by plain-transceiver.lua).
+function txSummary(tasks, args)
 	local total, totalRate = 0, 0
 	for i = 0, args.cores - 1 do
 		local sent, rate, lag, lagAt, phases = tasks[i]:wait()
@@ -75,6 +81,10 @@ function txSlave(queue, flow, args)
 	local seq = 0
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
+	-- plain-transceiver.lua gives its senders a common start time (args.txStart)
+	while mg.running() and mg.getTime() < (args.txStart or 0) do
+		mg.sleepMillis(1)
+	end
 	local start = mg.getTime()
 	-- the achieved rate is measured from the end of the ramp on
 	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp or start, 0
