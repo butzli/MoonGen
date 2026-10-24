@@ -39,7 +39,10 @@ function configure(parser)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 	parser:option("--tx-delay", "Seconds to wait before sending, so that the receivers of the peer are ready."):default(2):convert(tonumber)
 	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
+	parser:option("--ramp-stagger", "Milliseconds by which each transmit core reaches the full rate later than the previous one at the end of the ramp, so that the cores do not all reach it at the same instant."):default(50):convert(tonumber)
 	parser:option("--rx-linger", "Seconds to keep receiving after the own senders have stopped, to collect what the peer still sends."):default(2):convert(tonumber)
+	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
+	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(1):convert(tonumber)
 end
 
 function master(args)
@@ -47,7 +50,8 @@ function master(args)
 	args.flows = args.flows or args.tx_cores
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
-	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true}
+	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
+	args.ptp = ipsec.ptpClock(args.dev)
 	device.waitForLinks()
 	-- the tasks expect the options under the names of plain-gen.lua and plain-sink.lua
 	local tx, rx = {}, {}

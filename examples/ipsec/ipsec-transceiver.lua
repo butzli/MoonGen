@@ -1,7 +1,7 @@
 --- ESP (AES-GCM) generator and receiver/decoder on the same port: the transmit tasks of ipsec-gen.lua and the
 --- receive tasks of ipsec-sink.lua in one process, for bidirectional tests between two nodes that both run this script.
 --- Sending: one TX queue, one core and one outbound SA per TX core; SA i uses SPI spiBase + i and outer
---- addresses tunnelLocal + i -> tunnelRemote.
+--- addresses tunnelLocal + i -> tunnelRemote (with --tx-sas: more SAs than TX cores, see ipsec-gen.lua).
 --- Receiving: inbound SAs for the SPIs spiBase + i with outer addresses tunnelRemote + i -> tunnelLocal; one
 --- rte_flow rule per SA steers it to RX queue i mod rxCores (with --rss: RSS hash of the outer IPs instead).
 --- Only the receive offloads are switched off (ipsec-sink.lua switches off all of them): the NIC has to compute
@@ -23,8 +23,9 @@ function configure(parser)
 	parser:description("Sends ESP/AES-GCM encrypted UDP traffic and receives, decrypts and verifies the traffic of its peer on the same port.")
 	parser:argument("dev", "Device to transmit from and receive on."):convert(tonumber)
 	parser:option("--tx-cores", "Number of TX cores (= TX queues = SAs sent)."):default(1):convert(tonumber)
+	parser:option("--tx-sas", "Number of outbound SAs, at least --tx-cores, dealt out to the TX cores; default: --tx-cores."):convert(tonumber)
 	parser:option("--rx-cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
-	parser:option("-n --sas", "Number of SAs the peer sends (= its --tx-cores), default: own --tx-cores."):convert(tonumber)
+	parser:option("-n --sas", "Number of SAs the peer sends (= its --tx-sas), default: own --tx-sas."):convert(tonumber)
 	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption."):default(60):convert(tonumber)
 	parser:option("-b --bits", "AES key length (128 or 256), ignored if --key is given."):default(256):convert(tonumber)
 	parser:option("-k --key", "AES-GCM key + 4 byte salt as hex (RFC 4106 layout), used for both directions.")
@@ -44,7 +45,10 @@ function configure(parser)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 	parser:option("--tx-delay", "Seconds to wait before sending, so that the receivers of the peer are ready."):default(2):convert(tonumber)
 	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
+	parser:option("--ramp-stagger", "Milliseconds by which each transmit core reaches the full rate later than the previous one at the end of the ramp, so that the cores do not all reach it at the same instant."):default(50):convert(tonumber)
 	parser:option("--rx-linger", "Seconds to keep receiving after the own senders have stopped, to collect what the peer still sends."):default(2):convert(tonumber)
+	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
+	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
 end
 
 function master(args)
@@ -55,12 +59,14 @@ function master(args)
 		txSas, rxSas = ipsec.loadSaFile(args.sa_file, "out"), ipsec.loadSaFile(args.sa_file, "in")
 		args.tx_cores, args.sas = #txSas, #rxSas
 	end
-	args.sas = args.sas or args.tx_cores
+	args.tx_sas = args.tx_sas or args.tx_cores
+	args.sas = args.sas or args.tx_sas
 	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
-	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true}
+	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
+	args.ptp = ipsec.ptpClock(args.dev)
 	device.waitForLinks()
-	ipsec.init(args.tx_cores + args.rx_cores * args.sas + 16)
+	ipsec.init(args.tx_sas + args.rx_cores * args.sas + 16)
 	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
 	local tx, rx = {}, {}
 	for k, v in pairs(args) do

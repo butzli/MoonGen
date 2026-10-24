@@ -11,7 +11,7 @@ local memory = require "memory"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
-local ipsec  = require "ipsec-sw" -- flow isolation and generator payload
+local ipsec  = require "ipsec-sw" -- flow isolation, generator payload and NIC pacing
 
 function configure(parser)
 	parser:description("Generates cleartext UDP traffic with per-flow sequence numbers, one flow per core.")
@@ -25,13 +25,17 @@ function configure(parser)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
+	parser:option("--ramp-stagger", "Milliseconds by which each transmit core reaches the full rate later than the previous one at the end of the ramp, so that the cores do not all reach it at the same instant."):default(50):convert(tonumber)
+	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
+	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(1):convert(tonumber)
 end
 
 function master(args)
 	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
 	-- nothing is received here: all incoming frames stay with the kernel (ARP)
 	ipsec.isolate(args.txDev)
-	local txDev = device.config{port = args.txDev, txQueues = args.cores}
+	local txDev = device.config{port = args.txDev, txQueues = args.cores, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
+	args.ptp = ipsec.ptpClock(args.txDev)
 	device.waitForLinks()
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold caches
 	if args.rate <= 0 then args.ramp = 0 end
@@ -86,16 +90,22 @@ function txSlave(queue, flow, args)
 		mg.sleepMillis(1)
 	end
 	local start = mg.getTime()
-	-- the achieved rate is measured from the end of the ramp on
-	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp or start, 0
+	-- the achieved rate is measured from the end of the ramp on; with --ramp-stagger each core ends its ramp later by
+	-- its index times the stagger and sends at the full rate (capped) in between
+	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp + flow * (args.ramp_stagger or 0) * 1e-3 or start, 0
 	local ramping = args.ramp > 0
 	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the start)
 	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
 	local maxLag, maxLagAt, phases, behind = 0, 0, 0, false
+	-- --nic-pacing: each burst is handed to the NIC lead seconds ahead of its time, the NIC sends its packets spaced
+	-- evenly up to the next burst; the schedule below is unchanged (it counts in send times, now = time + lead)
+	local pacer = (args.nic_pacing or 0) > 0 and interval > 0 and ipsec.newPacer(args.ptp, args.nic_pacing * 1e-6, args.pacing_group)
+	local lead = pacer and pacer.lead or 0
 	local nextSend = start
 	while mg.running() do
-		while mg.getTime() < nextSend do end
-		local now = mg.getTime()
+		while mg.getTime() < nextSend - lead do end
+		local due = nextSend
+		local now = mg.getTime() + lead
 		if interval > 0 then
 			local lag = now - nextSend
 			if lag > maxLag then maxLag, maxLagAt = lag, now - start end
@@ -110,7 +120,7 @@ function txSlave(queue, flow, args)
 				ramping, fullStart, fullSeq = false, now, seq
 				nextSend = math.max(nextSend, now - 0.01) + interval
 			else
-				nextSend = now + interval / math.max((now - start) / args.ramp, 0.01)
+				nextSend = now + interval / math.max(math.min((now - start) / args.ramp, 1), 0.01)
 			end
 		else
 			nextSend = math.max(nextSend, now - 0.01) + interval
@@ -120,6 +130,7 @@ function txSlave(queue, flow, args)
 			ipsec.setPayloadSeq(buf:getUdpPacket(), seq)
 			seq = seq + 1
 		end
+		if pacer then pacer:stamp(bufs, bufs.size, due, (nextSend - due) / bufs.size) end
 		queue:send(bufs)
 	end
 	local rate = (seq - fullSeq) / (mg.getTime() - fullStart) / 1e6

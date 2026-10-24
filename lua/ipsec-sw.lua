@@ -350,4 +350,68 @@ function mod.plainRx(rxQueue, bufs, flows)
 	return C.mg_plain_rx(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, flows)
 end
 
+-- NIC pacing (--nic-pacing of the generators): the NIC sends every packet at the time it carries in its mbuf
+-- (send on timestamp, device.config with sendOnTimestamp = true), on the PTP clock of the NIC (kernel PHC).
+-- The transmit loop hands each burst over a lead time ahead of its time in the schedule, and the packets of the
+-- burst get times spaced evenly over the interval up to the next burst; the NIC thereby interleaves the packets of
+-- all transmit queues instead of sending each burst back to back at line rate.
+pcall(ffi.cdef, [[
+	int open(const char* pathname, int flags);
+	int rte_eth_dev_get_name_by_port(uint16_t port_id, char* name);
+]])
+require "utils" -- clock_gettime
+
+--- Device file of the PTP clock of a DPDK port (PCI devices only), e.g. /dev/ptp5; to be called in the master.
+function mod.ptpClock(port)
+	local name = ffi.new("char[64]")
+	if C.rte_eth_dev_get_name_by_port(port, name) ~= 0 then return nil end
+	local ls = io.popen("ls /sys/bus/pci/devices/" .. ffi.string(name) .. "/ptp 2>/dev/null")
+	local ptp = ls:read("*l")
+	ls:close()
+	return ptp and "/dev/" .. ptp
+end
+
+local pacer = {}
+pacer.__index = pacer
+
+--- Per transmit task: clock = mod.ptpClock of the port, lead in seconds; with group > 1 only every group-th packet
+--- carries a time and the ones in between follow it back to back (the NIC needs an extra work request per time).
+function mod.newPacer(clock, lead, group)
+	local dpdkc = require "dpdkc"
+	local fd = clock and C.open(clock, 0) or -1
+	local self = setmetatable({
+		off = dpdkc.dpdk_tx_timestamp_offset(), flag = dpdkc.dpdk_tx_timestamp_flag(), lead = lead, group = group or 1,
+		clk = bit.bor(bit.lshift(bit.bnot(fd), 3), 3), ts = ffi.new("struct timespec"), getTime = require("moongen").getTime,
+	}, pacer)
+	if self.off < 0 or fd < 0 then log:fatal("NIC pacing needs a device configured with sendOnTimestamp and its PTP clock (%s)", tostring(clock)) end
+	self:calibrate()
+	return self
+end
+
+--- Pair of mg.getTime (s) and NIC clock (ns, uint64) from the shortest of five reads (a read takes about 1.5 us).
+function pacer:calibrate()
+	local best = math.huge
+	for _ = 1, 5 do
+		local t0 = self.getTime()
+		C.clock_gettime(self.clk, self.ts)
+		local t1 = self.getTime()
+		if t1 - t0 < best then
+			best, self.t, self.ns = t1 - t0, (t0 + t1) / 2, ffi.cast("uint64_t", self.ts.tv_sec) * 1000000000ULL + self.ts.tv_nsec
+		end
+	end
+	-- TSC and NIC clock drift apart by some ppm: calibrate again after 100 ms
+	self.nextCal = self.t + 0.1
+end
+
+--- Send times for the first n packets of bufs: due (mg.getTime) for the first one, then every spacing seconds.
+function pacer:stamp(bufs, n, due, spacing)
+	if due > self.nextCal then self:calibrate() end
+	local base, step = (due - self.t) * 1e9, spacing * 1e9
+	for i = 0, n - 1, self.group do
+		local m = bufs.array[i]
+		ffi.cast("uint64_t*", ffi.cast("uint8_t*", m) + self.off)[0] = self.ns + ffi.cast("int64_t", base + i * step)
+		m.ol_flags = bit.bor(m.ol_flags, self.flag)
+	end
+end
+
 return mod
