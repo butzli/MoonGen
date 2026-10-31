@@ -34,7 +34,7 @@ function configure(parser)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 	parser:option("--tx-delay", "Seconds to wait before sending."):default(0):convert(tonumber)
 	parser:option("--ramp", "Seconds over which the send rate rises linearly to --rate at the start (not used without a rate limit)."):default(1):convert(tonumber)
-	parser:option("--ramp-stagger", "Milliseconds by which each transmit core reaches the full rate later than the previous one at the end of the ramp, so that the cores do not all reach it at the same instant."):default(50):convert(tonumber)
+	parser:option("--ramp-stagger", "Milliseconds by which each transmit core changes from the ramp to the fixed schedule later than the previous one, so that the cores do not all change at the same instant."):default(50):convert(tonumber)
 	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
 end
@@ -160,8 +160,8 @@ function txSlave(queue, core, args)
 		mg.sleepMillis(1)
 	end
 	local start, sent = mg.getTime(), 0
-	-- the achieved rate is measured from the end of the ramp on; with --ramp-stagger each core ends its ramp later by
-	-- its index times the stagger and sends at the full rate (capped) in between
+	-- the achieved rate is measured from the change to the fixed schedule on; all cores reach the full rate after the
+	-- ramp, and with --ramp-stagger each core changes later by its index times the stagger
 	local fullStart, fullSent = args.ramp > 0 and start + args.ramp + core * (args.ramp_stagger or 0) * 1e-3 or start, 0
 	local ramping = args.ramp > 0
 	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the senders started)
