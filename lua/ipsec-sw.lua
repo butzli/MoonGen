@@ -3,6 +3,8 @@
 --- @brief Software IPsec (ESP, AES-GCM) based on DPDK rte_ipsec + CPU crypto (ipsec_mb).
 --- Requires the crypto vdev in the DPDK config, e.g. cli = { "--vdev=crypto_aesni_gcm0" },
 --- and DPDK built with libipsec-mb-dev installed.
+--- Also holds what the cleartext programs (plain-*.lua) share with the IPsec ones: the generator payload and its
+--- check per flow, the NIC steering by rte_flow and the NIC pacing.
 ---------------------------------
 
 local ffi = require "ffi"
@@ -28,7 +30,7 @@ ffi.cdef[[
 		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket);
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
-	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last);
+	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint64_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
 		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails);
 	uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok);
@@ -41,7 +43,7 @@ ffi.cdef[[
 	};
 	struct mg_flows {
 		uint64_t other;
-		struct mg_flow f[4096];
+		struct mg_flow f[4096]; // = MG_FLOWS_MAX in src/ipsec-sw.c, both must be the same
 	};
 
 	uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
@@ -55,11 +57,11 @@ local mod = {}
 mod.defaultCryptoDev = "crypto_aesni_gcm0"
 
 --- Initialize the crypto device. Call once in master() before starting tasks.
---- @param maxSessions number of SAs that will be created in total (all tasks)
+--- @param maxSessions number of SAs that will be created in total (all tasks); the session pool gets 16 more as reserve
 --- @param cryptoDev name of the crypto vdev, default crypto_aesni_gcm0
 function mod.init(maxSessions, cryptoDev, socket)
 	cryptoDev = cryptoDev or mod.defaultCryptoDev
-	local id = C.mg_ipsec_init(cryptoDev, maxSessions or 1024, socket or 0)
+	local id = C.mg_ipsec_init(cryptoDev, (maxSessions or 1024) + 16, socket or 0)
 	if id < 0 then
 		log:fatal("Could not initialize IPsec crypto device %s", cryptoDev)
 	end
@@ -326,12 +328,12 @@ function mod.steerSrcIp(rxQueue, ip)
 	steer(rxQueue, "source IP " .. tostring(ip), { spec, mask })
 end
 
---- First and last ESP sequence number mod.rxDecrypt received for this SA.
+--- First and last ESP sequence number mod.rxDecrypt received for this SA, extended to 64 bits across wraps.
 --- @return number of packets received, first sequence number, last sequence number
 function mod.rxRange(sa)
-	local range = ffi.new("uint32_t[2]")
+	local range = ffi.new("uint64_t[2]")
 	local seen = tonumber(C.mg_ipsec_sa_rx_range(sa, range, range + 1))
-	return seen, range[0], range[1]
+	return seen, tonumber(range[0]), tonumber(range[1])
 end
 
 function mod.newRxStats()
@@ -340,9 +342,10 @@ end
 
 --- Receive, decrypt, count and free one burst; with flows (mod.newFlows) also check the payload of the decrypted
 --- packets, whose inner IPv4 header starts at offset 0 in tunnel mode and after the Ethernet header in transport mode.
+local ETH_HDR_LEN = 14
 function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats, flows, mode)
 	return C.mg_ipsec_rx_decrypt(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, saTable, numSas, spiBase, stats, flows,
-		mode == "transport" and 14 or 0)
+		mode == "transport" and ETH_HDR_LEN or 0)
 end
 
 --- Receive one burst of cleartext packets, check their payload into flows (mod.newFlows) and free them.
@@ -380,10 +383,19 @@ function mod.newPacer(clock, lead, group)
 	local dpdkc = require "dpdkc"
 	local fd = clock and C.open(clock, 0) or -1
 	local self = setmetatable({
-		off = dpdkc.dpdk_tx_timestamp_offset(), flag = dpdkc.dpdk_tx_timestamp_flag(), lead = lead, group = group or 1,
-		clk = bit.bor(bit.lshift(bit.bnot(fd), 3), 3), ts = ffi.new("struct timespec"), getTime = require("moongen").getTime,
+		-- mbuf field and flag of the send time, registered by libmoon's device.config with sendOnTimestamp
+		off = dpdkc.dpdk_tx_timestamp_offset(),
+		flag = dpdkc.dpdk_tx_timestamp_flag(),
+		lead = lead,
+		group = group or 1,
+		-- clock id of the opened PTP clock for clock_gettime: FD_TO_CLOCKID(fd) = (~fd << 3) | 3 of the Linux kernel
+		clk = bit.bor(bit.lshift(bit.bnot(fd), 3), 3),
+		ts = ffi.new("struct timespec"),
+		getTime = require("moongen").getTime,
 	}, pacer)
-	if self.off < 0 or fd < 0 then log:fatal("NIC pacing needs a device configured with sendOnTimestamp and its PTP clock (%s)", tostring(clock)) end
+	if self.off < 0 or fd < 0 then
+		log:fatal("NIC pacing needs a device configured with sendOnTimestamp and its PTP clock (%s)", tostring(clock))
+	end
 	self:calibrate()
 	return self
 end
@@ -396,7 +408,9 @@ function pacer:calibrate()
 		C.clock_gettime(self.clk, self.ts)
 		local t1 = self.getTime()
 		if t1 - t0 < best then
-			best, self.t, self.ns = t1 - t0, (t0 + t1) / 2, ffi.cast("uint64_t", self.ts.tv_sec) * 1000000000ULL + self.ts.tv_nsec
+			best = t1 - t0
+			self.t = (t0 + t1) / 2
+			self.ns = ffi.cast("uint64_t", self.ts.tv_sec) * 1000000000ULL + self.ts.tv_nsec
 		end
 	end
 	-- TSC and NIC clock drift apart by some ppm: calibrate again after 100 ms

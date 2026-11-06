@@ -66,7 +66,7 @@ function master(args)
 	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
 	args.ptp = ipsec.ptpClock(args.dev)
 	device.waitForLinks()
-	ipsec.init(args.tx_sas + args.rx_cores * args.sas + 16)
+	ipsec.init(args.tx_sas + args.rx_cores * args.sas)
 	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
 	local tx, rx = {}, {}
 	for k, v in pairs(args) do

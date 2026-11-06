@@ -52,7 +52,7 @@ function master(args)
 	args.ptp = ipsec.ptpClock(args.txDev)
 	device.waitForLinks()
 	args.tx_sas = args.tx_sas or args.cores
-	ipsec.init(args.tx_sas + 16)
+	ipsec.init(args.tx_sas)
 	txSetup(args)
 	local tasks = {}
 	for i = 0, args.cores - 1 do

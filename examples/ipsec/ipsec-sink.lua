@@ -47,7 +47,7 @@ function master(args)
 	if not args.rss then ipsec.isolate(args.rxDev) end
 	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
-	ipsec.init(args.cores * args.sas + 16)
+	ipsec.init(args.cores * args.sas)
 	for i = 0, args.rss and -1 or args.sas - 1 do
 		ipsec.steerSpi(rxDev:getRxQueue(i % args.cores), rxSa(args, i).spi)
 	end
@@ -140,12 +140,12 @@ function rxSlave(queue, core, args)
 	end
 	log:info("Queue %d: " .. SUMMARY, core, unpack(res))
 	-- per SA: packets missing between the first and the last sequence number received (the sender starts at 1);
-	-- these are the 32 bits carried in the packets, so the count holds across one wrap but not beyond 2^32 packets
+	-- the sequence numbers are extended to 64 bits across wraps of the 32 bits in the packets (ipsec-sw.c)
 	local missing = 0
 	for i, sa in ipairs(sas) do
 		local seen, first, last = ipsec.rxRange(sa)
 		if seen > 0 then
-			local gap = (last - first) % 2^32 + 1 - seen
+			local gap = last - first + 1 - seen
 			log:info("Queue %d: SPI %d: ESP sequence numbers %d..%d, received %d, missing in between %d",
 				core, spis[i], first, last, seen, gap)
 			missing = missing + gap

@@ -3,6 +3,8 @@
 // (RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO), e.g. with the ipsec_mb based
 // crypto_aesni_gcm vdev. All ESP processing (header, IV, SQN, padding,
 // trailer, ICV, tunnel encap/decap, anti-replay) is done by rte_ipsec.
+// Also holds the receive path of the cleartext programs (mg_plain_rx) and the check of the generator payload per flow,
+// which both kinds of receiver share.
 
 #include <string.h>
 #include <stdio.h>
@@ -34,8 +36,8 @@ struct mg_ipsec_sa {
 	int outbound;
 	int tunnel;
 	uint32_t spi;
-	uint32_t first_seq;           // ESP sequence number of the first/last packet received for this SA
-	uint32_t last_seq;
+	uint64_t first_seq;           // ESP sequence number of the first/last packet received for this SA, extended
+	uint64_t last_seq;            // to 64 bits across wraps of the 32 bits in the packet (see mg_ipsec_rx_decrypt)
 	uint64_t seen;                 // packets received for this SA (before replay check and decryption)
 };
 
@@ -347,7 +349,7 @@ uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 
 // First and last ESP sequence number received for this SA by mg_ipsec_rx_decrypt and the number of
 // packets in between; a difference means that packets of this SA were lost. Returns the number of packets seen.
-uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint32_t* first, uint32_t* last) {
+uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint64_t* last) {
 	*first = s->first_seq;
 	*last = s->last_seq;
 	return s->seen;
@@ -400,8 +402,12 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		uint32_t seq = rte_be_to_cpu_32(esph->seq);
 		if (!sas[sa_idx]->seen++) {
 			sas[sa_idx]->first_seq = seq;
+			sas[sa_idx]->last_seq = seq;
+		} else {
+			// the packet carries only the low 32 bits: step from the previous one by their signed difference,
+			// so that a wrap counts on in the upper bits instead of jumping back (as ESN infers the high bits)
+			sas[sa_idx]->last_seq += (int32_t)(seq - (uint32_t)sas[sa_idx]->last_seq);
 		}
-		sas[sa_idx]->last_seq = seq;
 		esp[n_esp] = m;
 		idx[n_esp] = sa_idx;
 		n_esp++;
