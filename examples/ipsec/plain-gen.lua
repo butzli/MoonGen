@@ -10,6 +10,7 @@ local mg     = require "moongen"
 local memory = require "memory"
 local device = require "device"
 local stats  = require "stats"
+local ffi    = require "ffi"
 local log    = require "log"
 local ipsec  = require "ipsec-sw" -- flow isolation, generator payload and NIC pacing
 
@@ -17,7 +18,7 @@ function configure(parser)
 	parser:description("Generates cleartext UDP traffic with per-flow sequence numbers, one flow per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
 	parser:option("-c --cores", "Number of TX cores (= queues = flows)."):default(1):convert(tonumber)
-	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60."):default(60):convert(tonumber)
+	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("--src", "Source IP of the first flow (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC."):default("ff:ff:ff:ff:ff:ff")
@@ -31,7 +32,7 @@ function configure(parser)
 end
 
 function master(args)
-	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
+	args.sizes = ipsec.sizes(args.size)
 	-- nothing is received here: all incoming frames stay with the kernel (ARP)
 	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
@@ -65,8 +66,7 @@ function txSummary(tasks, args)
 end
 
 function txSlave(queue, flow, args)
-	-- everything except the sequence number is constant per flow and filled only once
-	local mem = memory.createMemPool{n = 8191, func = function(buf)
+	local function fill(buf, len)
 		local pkt = buf:getUdpPacket()
 		pkt:fill{
 			ethSrc = queue,
@@ -75,13 +75,20 @@ function txSlave(queue, flow, args)
 			ip4Dst = args.dst,
 			udpSrc = 1234,
 			udpDst = 5678,
-			pktLength = args.size,
+			pktLength = len,
 		}
 		pkt.ip4:calculateChecksum()
 		pkt.udp:setChecksum(0)
 		ipsec.fillPayload(pkt, flow)
-	end}
+	end
+	-- one size: everything except the sequence number is constant per flow and filled only once; a size mix (imix):
+	-- every packet is copied from the template of its size in the order of the pattern (ipsec.fillMix)
+	local mix, size = #args.sizes > 1, args.sizes[1]
+	local mem = memory.createMemPool{n = 8191, func = not mix and function(buf) fill(buf, size) end or nil}
 	local bufs = mem:bufArray(args.burst)
+	local tmpl = mix and ipsec.mixTemplates(args.sizes, bufs, fill)
+	local allocSize = math.max(unpack(args.sizes))
+	local pos, seqp = ffi.new("uint16_t[1]"), ffi.new("uint64_t[1]")
 	local seq = 0
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
@@ -125,10 +132,15 @@ function txSlave(queue, flow, args)
 		else
 			nextSend = math.max(nextSend, now - 0.01) + interval
 		end
-		bufs:alloc(args.size)
-		for _, buf in ipairs(bufs) do
-			ipsec.setPayloadSeq(buf:getUdpPacket(), seq)
-			seq = seq + 1
+		bufs:alloc(allocSize)
+		if mix then
+			ipsec.fillMix(bufs, bufs.size, tmpl, pos, seqp)
+			seq = seq + bufs.size
+		else
+			for _, buf in ipairs(bufs) do
+				ipsec.setPayloadSeq(buf:getUdpPacket(), seq)
+				seq = seq + 1
+			end
 		end
 		if pacer then pacer:stamp(bufs, bufs.size, due, (nextSend - due) / bufs.size) end
 		queue:send(bufs)

@@ -33,6 +33,8 @@ ffi.cdef[[
 	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint64_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
 		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails);
+	void mg_fill_mix(struct rte_mbuf** mb, uint16_t n, const uint8_t* const* tmpls, const uint16_t* lens, uint16_t plen,
+		uint16_t* pos, uint64_t* seq);
 	uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok);
 
 	struct mg_flow {
@@ -165,6 +167,46 @@ end
 --- Write the sequence number into the payload of a UDP packet.
 function mod.setPayloadSeq(udpPkt, seq)
 	udpPkt.payload.uint64[1] = seq
+end
+
+--- Packet size mix of the generators for "-s imix": the 7 : 4 : 1 mix of FD.io CSIT (64, 570, 1518 bytes with CRC),
+--- but with 1460 instead of 1514 bytes as the largest frame (sizes without CRC), the largest cleartext frame whose
+--- ESP frame in tunnel mode (1514 bytes, no padding) still fits the MTU of 1500 bytes; spread evenly over a pattern
+--- of 12 packets. Mean 345.3 bytes as cleartext, 400 bytes as ESP frame (114, 622, 1514).
+mod.IMIX = { 60, 566, 60, 60, 566, 60, 1460, 60, 566, 60, 60, 566 }
+
+--- The packet sizes of the value of a generator's size option: { n } for a number n, mod.IMIX for "imix".
+function mod.sizes(s)
+	if s == "imix" then return mod.IMIX end
+	local n = tonumber(s)
+	if not n or n < mod.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload) or imix", mod.MIN_FRAME) end
+	return { n }
+end
+
+--- Packet template of len bytes: fill(buf, len) fills the first buffer of bufs, which is then copied.
+function mod.template(bufs, len, fill)
+	bufs:alloc(len)
+	fill(bufs[1], len)
+	local t = ffi.new("uint8_t[?]", len)
+	ffi.copy(t, bufs[1]:getData(), len)
+	bufs:freeAll()
+	return t
+end
+
+--- Templates of a size pattern (mod.sizes) for mod.fillMix, one per distinct size (see mod.template).
+function mod.mixTemplates(sizes, bufs, fill)
+	local mix = { n = #sizes, ptrs = ffi.new("const uint8_t*[?]", #sizes), lens = ffi.new("uint16_t[?]", #sizes), bySize = {} }
+	for i, len in ipairs(sizes) do
+		mix.bySize[len] = mix.bySize[len] or mod.template(bufs, len, fill)
+		mix.ptrs[i - 1], mix.lens[i - 1] = mix.bySize[len], len
+	end
+	return mix
+end
+
+--- Fill bufs[0..n-1] from the templates of mod.mixTemplates in the order of the pattern, which continues from pos[0]
+--- (uint16_t[1]); every packet gets the next sequence number from seq[0] (uint64_t[1]).
+function mod.fillMix(bufs, n, mix, pos, seq)
+	C.mg_fill_mix(bufs.array, n, mix.ptrs, mix.lens, mix.n, pos, seq)
 end
 
 --- Per-flow state of one receive queue for mod.rxDecrypt and mod.plainRx.

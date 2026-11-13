@@ -333,6 +333,27 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 	return k;
 }
 
+// Fill mb[0..n-1] for a mix of packet sizes (IMIX): packet i is a copy of template tmpls[k] of lens[k] bytes,
+// where k runs through the pattern of plen entries and continues from *pos, so that the pattern goes on across
+// bursts. The templates hold the generator payload; every packet gets the next sequence number of the flow from
+// *seq. Used before mg_ipsec_encrypt_burst (with tmpl = NULL) and for cleartext packets.
+void mg_fill_mix(struct rte_mbuf** mb, uint16_t n, const uint8_t* const* tmpls, const uint16_t* lens, uint16_t plen,
+		uint16_t* pos, uint64_t* seq) {
+	uint16_t k = *pos;
+	uint64_t q = *seq;
+	for (uint16_t i = 0; i < n; i++) {
+		struct rte_mbuf* m = mb[i];
+		m->data_off = RTE_PKTMBUF_HEADROOM;
+		rte_memcpy(rte_pktmbuf_mtod(m, void*), tmpls[k], lens[k]);
+		m->data_len = lens[k];
+		m->pkt_len = lens[k];
+		rte_pktmbuf_mtod_offset(m, struct mg_payload*, MG_PAYLOAD_OFF)->seq = q++;
+		if (++k == plen) k = 0;
+	}
+	*pos = k;
+	*seq = q;
+}
+
 // Decrypt a burst of received ESP packets for one SA in place (all packets must belong to this SA).
 // Successfully decrypted packets are at mb[0..ret-1], rejected ones at the end (not freed).
 // n - *prep_ok are replay/malformed rejects, *prep_ok - ret are ICV/trailer failures.
@@ -385,6 +406,15 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		 || m->data_len < MG_IPSEC_ETH_LEN + rte_ipv4_hdr_len(ip) + sizeof(struct rte_esp_hdr)) {
 			st->non_esp++;
 			continue;
+		}
+		// The length of the packet is taken from its IP header, not from the NIC: with CQE compression (the default
+		// of the mlx5 PMD), packets of different sizes that arrive densely were delivered with the length of another
+		// packet (2026-11-13: about half of the packets of a size mix then failed the ICV check, none without
+		// compression or with a single size). The data itself is complete in the buffer.
+		uint16_t len = MG_IPSEC_ETH_LEN + rte_be_to_cpu_16(ip->total_length);
+		if (len != m->pkt_len && m->nb_segs == 1 && len <= m->buf_len - m->data_off) {
+			m->data_len = len;
+			m->pkt_len = len;
 		}
 		struct rte_esp_hdr* esph = (struct rte_esp_hdr*) ((uint8_t*) ip + rte_ipv4_hdr_len(ip));
 		uint32_t spi = rte_be_to_cpu_32(esph->spi);

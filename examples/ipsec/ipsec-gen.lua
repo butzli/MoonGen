@@ -19,7 +19,7 @@ function configure(parser)
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
 	parser:option("-c --cores", "Number of TX cores (= queues = SAs)."):default(1):convert(tonumber)
 	parser:option("--tx-sas", "Number of outbound SAs, at least --cores, dealt out to the cores; default: --cores."):convert(tonumber)
-	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption, at least 60."):default(60):convert(tonumber)
+	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption, at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("-b --bits", "AES key length (128 or 256), ignored if --key is given."):default(256):convert(tonumber)
 	parser:option("-k --key", "AES-GCM key + 4 byte salt as hex (RFC 4106 layout).")
 	parser:option("-m --mode", "tunnel or transport."):default("tunnel")
@@ -70,7 +70,7 @@ end
 --- Fixes the start of the senders and the run time; to be called once before the transmit tasks are started
 --- (also used by ipsec-transceiver.lua).
 function txSetup(args)
-	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
+	args.sizes = ipsec.sizes(args.size)
 	if args.saList and args.tx_sas ~= args.cores then log:fatal("--tx-sas does not go with --sa-file") end
 	if args.tx_sas < args.cores or args.tx_sas > ipsec.MAX_FLOWS then log:fatal("--tx-sas must be between --cores and %d (payload flows)", ipsec.MAX_FLOWS) end
 	args.txStart = mg.getTime() + args.tx_delay
@@ -114,7 +114,10 @@ function txSlave(queue, core, args)
 	local bufs = mem:bufArray(args.burst)
 	-- per SA of the core: the SA, the inner packet template (encryption happens in place, so every mbuf is re-filled
 	-- from it before each use) and the sequence number of its flow in the inner payload, written into every packet
-	-- by ipsec.encrypt
+	-- by ipsec.encrypt; with a size mix (imix) one template per size, used in the order of the pattern
+	local mix, size = #args.sizes > 1, args.sizes[1]
+	local allocSize = math.max(unpack(args.sizes))
+	local pos = ffi.new("uint16_t[1]")
 	local nSas, sas, tmpls, seqs = 0, {}, {}, {}
 	for i = core, args.tx_sas - 1, args.cores do
 		nSas = nSas + 1
@@ -132,23 +135,22 @@ function txSlave(queue, core, args)
 			dstMac = args.dst_mac,
 			socket = select(2, mg.getCore()),
 		}
-		bufs:alloc(args.size)
-		local pkt = bufs[1]:getUdpPacket()
-		pkt:fill{
-			ethSrc = queue,
-			ethDst = args.dst_mac,
-			ip4Src = entry.innerSrc or parseIP4Address("10.0.0.1") + i,
-			ip4Dst = entry.innerDst or "10.1.0.1",
-			udpSrc = 1234,
-			udpDst = 5678,
-			pktLength = args.size,
-		}
-		pkt.ip4:calculateChecksum()
-		pkt.udp:setChecksum(0)
-		ipsec.fillPayload(pkt, i)
-		tmpls[j] = ffi.new("uint8_t[?]", args.size)
-		ffi.copy(tmpls[j], bufs[1]:getData(), args.size)
-		bufs:freeAll()
+		local function fill(buf, len)
+			local pkt = buf:getUdpPacket()
+			pkt:fill{
+				ethSrc = queue,
+				ethDst = args.dst_mac,
+				ip4Src = entry.innerSrc or parseIP4Address("10.0.0.1") + i,
+				ip4Dst = entry.innerDst or "10.1.0.1",
+				udpSrc = 1234,
+				udpDst = 5678,
+				pktLength = len,
+			}
+			pkt.ip4:calculateChecksum()
+			pkt.udp:setChecksum(0)
+			ipsec.fillPayload(pkt, i)
+		end
+		tmpls[j] = mix and ipsec.mixTemplates(args.sizes, bufs, fill) or ipsec.template(bufs, size, fill)
 		seqs[j] = ffi.new("uint64_t[1]")
 	end
 	local cur, sa, tmpl, seq = 1, sas[1], tmpls[1], seqs[1]
@@ -199,12 +201,18 @@ function txSlave(queue, core, args)
 			cur = cur % nSas + 1
 			sa, tmpl, seq = sas[cur], tmpls[cur], seqs[cur]
 		end
-		bufs:alloc(args.size)
-		local n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, args.size, fails, seq)
+		bufs:alloc(allocSize)
+		local n
+		if mix then
+			ipsec.fillMix(bufs, bufs.size, tmpl, pos, seq)
+			n = ipsec.encrypt(sa, bufs, bufs.size, nil, 0, fails, nil)
+		else
+			n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, size, fails, seq)
+		end
 		if n > 0 then
 			if first then
 				first = false
-				log:info("Core %d: %s, inner frame %d B -> ESP frame %d B", core, coreSpis(args, core), args.size, bufs.array[0].pkt_len)
+				log:info("Core %d: %s, inner frame %s B -> ESP frame %d B%s", core, coreSpis(args, core), args.size, bufs.array[0].pkt_len, mix and " (first one)" or "")
 			end
 			if pacer then pacer:stamp(bufs, n, due, (nextSend - due) / bufs.size) end
 			queue:sendN(bufs, n)

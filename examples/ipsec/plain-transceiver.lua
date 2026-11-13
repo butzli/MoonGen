@@ -26,7 +26,7 @@ function configure(parser)
 	parser:option("--tx-cores", "Number of TX cores (= TX queues = flows sent)."):default(1):convert(tonumber)
 	parser:option("--rx-cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
 	parser:option("-n --flows", "Number of flows the peer sends (= its --tx-cores), default: own --tx-cores."):convert(tonumber)
-	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60."):default(60):convert(tonumber)
+	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("--src", "Source IP of the first flow sent (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP of the flows sent."):default("192.168.1.1")
 	parser:option("--rx-src", "Source IP of the first flow received (incremented per flow)."):default("192.168.1.1")
@@ -46,7 +46,7 @@ function configure(parser)
 end
 
 function master(args)
-	if args.size < ipsec.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload)", ipsec.MIN_FRAME) end
+	args.sizes = ipsec.sizes(args.size)
 	args.flows = args.flows or args.tx_cores
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
