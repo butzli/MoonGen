@@ -2,7 +2,8 @@
 --- receive tasks of plain-sink.lua in one process, the cleartext twin of ipsec-transceiver.lua. For bidirectional
 --- cleartext tests between two nodes, and for the cleartext side of a device that en- and decrypts, whose ESP side
 --- then runs ipsec-transceiver.lua.
---- Sending: one TX queue, one core and one flow per TX core; flow i goes from src + i to dst.
+--- Sending: one TX queue, one core and one flow per TX core; flow i goes from src + i to dst (with --tx-flows: more
+--- flows than TX cores, with --vary dst: from src to dst + i, see plain-gen.lua).
 --- Receiving: one rte_flow rule per flow steers source address rxSrc + i to RX queue i mod rxCores (with --rss:
 --- RSS hash instead). Both sides carry the same generator payload (ipsec-sw.lua), so the receivers also check the
 --- traffic of ipsec-gen.lua after the device has decrypted it; packets without it are counted per queue as other.
@@ -23,9 +24,11 @@ require "plain-sink"
 function configure(parser)
 	parser:description("Sends cleartext UDP traffic with per-flow sequence numbers and receives and verifies the traffic of its peer on the same port.")
 	parser:argument("dev", "Device to transmit from and receive on."):convert(tonumber)
-	parser:option("--tx-cores", "Number of TX cores (= TX queues = flows sent)."):default(1):convert(tonumber)
+	parser:option("--tx-cores", "Number of TX cores (= TX queues)."):default(1):convert(tonumber)
+	parser:option("--tx-flows", "Number of flows sent, at least --tx-cores, dealt out to the TX cores; default: --tx-cores."):convert(tonumber)
+	parser:option("--vary", "Address incremented per flow sent: src or dst."):default("src")
 	parser:option("--rx-cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
-	parser:option("-n --flows", "Number of flows the peer sends (= its --tx-cores), default: own --tx-cores."):convert(tonumber)
+	parser:option("-n --flows", "Number of flows the peer sends (= its --tx-flows), default: own --tx-flows."):convert(tonumber)
 	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("--src", "Source IP of the first flow sent (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP of the flows sent."):default("192.168.1.1")
@@ -47,7 +50,8 @@ end
 
 function master(args)
 	args.sizes = ipsec.sizes(args.size)
-	args.flows = args.flows or args.tx_cores
+	checkFlows(args, args.tx_cores)
+	args.flows = args.flows or args.tx_flows
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
 	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}

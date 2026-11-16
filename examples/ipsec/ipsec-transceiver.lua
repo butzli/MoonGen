@@ -22,7 +22,7 @@ require "ipsec-sink"
 function configure(parser)
 	parser:description("Sends ESP/AES-GCM encrypted UDP traffic and receives, decrypts and verifies the traffic of its peer on the same port.")
 	parser:argument("dev", "Device to transmit from and receive on."):convert(tonumber)
-	parser:option("--tx-cores", "Number of TX cores (= TX queues = SAs sent)."):default(1):convert(tonumber)
+	parser:option("--tx-cores", "Number of TX cores (= TX queues), default 1; with --sa-file default: one per outbound SA of the file."):convert(tonumber)
 	parser:option("--tx-sas", "Number of outbound SAs, at least --tx-cores, dealt out to the TX cores; default: --tx-cores."):convert(tonumber)
 	parser:option("--rx-cores", "Number of RX cores (= RX queues)."):default(1):convert(tonumber)
 	parser:option("-n --sas", "Number of SAs the peer sends (= its --tx-sas), default: own --tx-sas."):convert(tonumber)
@@ -34,7 +34,7 @@ function configure(parser)
 	parser:option("--tunnel-local", "Own outer IP: source of the first SA sent (incremented per SA), destination of the SAs received."):default("192.168.0.1")
 	parser:option("--tunnel-remote", "Outer IP of the peer: destination of the SAs sent, source of the first SA received (incremented per SA)."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
-	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --tx-cores, --sas, --key, --spi-base and the addresses.")
+	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile, dealt out to the TX cores like --tx-sas; replaces --tx-sas, --sas, --key, --spi-base and the addresses.")
 	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
@@ -57,8 +57,10 @@ function master(args)
 	local txSas, rxSas
 	if args.sa_file then
 		txSas, rxSas = ipsec.loadSaFile(args.sa_file, "out"), ipsec.loadSaFile(args.sa_file, "in")
-		args.tx_cores, args.sas = #txSas, #rxSas
+		if args.tx_sas and args.tx_sas ~= #txSas then log:fatal("--tx-sas does not go with --sa-file") end
+		args.tx_sas, args.sas = #txSas, #rxSas
 	end
+	args.tx_cores = args.tx_cores or (txSas and #txSas or 1)
 	args.tx_sas = args.tx_sas or args.tx_cores
 	args.sas = args.sas or args.tx_sas
 	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames

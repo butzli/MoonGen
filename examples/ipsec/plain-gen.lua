@@ -1,6 +1,9 @@
 --- Cleartext UDP traffic generator, counterpart of plain-sink.lua and cleartext twin of ipsec-gen.lua.
 --- One TX queue, one core and one flow per core; flow i uses source IP src + i (like the outer source IP
 --- of SA i in ipsec-gen.lua), so the receiver's RSS spreads the flows over its queues.
+--- With --tx-flows n the n flows are dealt out to the cores in turn (flow i to core i mod cores), and every core sends
+--- its flows in turn, one burst each (like --tx-sas of ipsec-gen.lua); with --vary dst, flow i goes from src to dst + i
+--- instead, e.g. to the inner addresses of the peers of a device in between (address plan in pos-scripts/ike).
 --- The UDP payload is the generator payload of ipsec-sw.lua (magic, flow, sequence number per flow), the same as the
 --- inner payload of ipsec-gen.lua, so that ipsec-sink.lua can check this traffic after a device in between has
 --- encrypted it.
@@ -17,7 +20,9 @@ local ipsec  = require "ipsec-sw" -- flow isolation, generator payload and NIC p
 function configure(parser)
 	parser:description("Generates cleartext UDP traffic with per-flow sequence numbers, one flow per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
-	parser:option("-c --cores", "Number of TX cores (= queues = flows)."):default(1):convert(tonumber)
+	parser:option("-c --cores", "Number of TX cores (= queues)."):default(1):convert(tonumber)
+	parser:option("--tx-flows", "Number of flows, at least --cores, dealt out to the cores; default: --cores."):convert(tonumber)
+	parser:option("--vary", "Address incremented per flow: src or dst."):default("src")
 	parser:option("-s --size", "Packet size (Ethernet frame without CRC), at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("--src", "Source IP of the first flow (incremented per flow)."):default("192.168.0.1")
 	parser:option("--dst", "Destination IP."):default("192.168.1.1")
@@ -33,6 +38,7 @@ end
 
 function master(args)
 	args.sizes = ipsec.sizes(args.size)
+	checkFlows(args, args.cores)
 	-- nothing is received here: all incoming frames stay with the kernel (ARP)
 	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
@@ -54,41 +60,64 @@ function master(args)
 	txSummary(tasks, args)
 end
 
+--- Checks --tx-flows and --vary for cores transmit cores (also used by plain-transceiver.lua).
+function checkFlows(args, cores)
+	args.tx_flows = args.tx_flows or cores
+	if args.tx_flows < cores or args.tx_flows > ipsec.MAX_FLOWS then log:fatal("--tx-flows must be between the number of TX cores and %d (payload flows)", ipsec.MAX_FLOWS) end
+	if args.vary ~= "src" and args.vary ~= "dst" then log:fatal("--vary must be src or dst") end
+end
+
 --- Waits for the transmit tasks and prints their results (also used by plain-transceiver.lua).
 function txSummary(tasks, args)
 	local total, totalRate = 0, 0
 	for i = 0, args.cores - 1 do
 		local sent, rate, lag, lagAt, phases = tasks[i]:wait()
-		log:info("Flow %d: sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, sent, lag * 1e3, lagAt, phases)
+		log:info("Core %d: sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, sent, lag * 1e3, lagAt, phases)
 		total, totalRate = total + sent, totalRate + rate
 	end
 	log:info("Total: sent %d, rate %.2f Mpps", total, totalRate)
 end
 
-function txSlave(queue, flow, args)
-	local function fill(buf, len)
-		local pkt = buf:getUdpPacket()
-		pkt:fill{
-			ethSrc = queue,
-			ethDst = args.dst_mac,
-			ip4Src = parseIP4Address(args.src) + flow,
-			ip4Dst = args.dst,
-			udpSrc = 1234,
-			udpDst = 5678,
-			pktLength = len,
-		}
-		pkt.ip4:calculateChecksum()
-		pkt.udp:setChecksum(0)
-		ipsec.fillPayload(pkt, flow)
+function txSlave(queue, core, args)
+	-- the flows of this core: core, core + cores, ... below tx_flows
+	local flows = {}
+	for i = core, (args.tx_flows or args.cores) - 1, args.cores do
+		flows[#flows + 1] = i
 	end
-	-- one size: everything except the sequence number is constant per flow and filled only once; a size mix (imix):
-	-- every packet is copied from the template of its size in the order of the pattern (ipsec.fillMix)
+	local function filler(flow)
+		local src, dst = parseIP4Address(args.src), parseIP4Address(args.dst)
+		if args.vary == "dst" then dst = dst + flow else src = src + flow end
+		return function(buf, len)
+			local pkt = buf:getUdpPacket()
+			pkt:fill{
+				ethSrc = queue,
+				ethDst = args.dst_mac,
+				ip4Src = src,
+				ip4Dst = dst,
+				udpSrc = 1234,
+				udpDst = 5678,
+				pktLength = len,
+			}
+			pkt.ip4:calculateChecksum()
+			pkt.udp:setChecksum(0)
+			ipsec.fillPayload(pkt, flow)
+		end
+	end
+	-- one size and one flow: everything except the sequence number is constant and filled only once; a size mix
+	-- (imix) or several flows: every packet is copied from the template of its flow and size, in the order of the
+	-- pattern (ipsec.fillMix), and each burst belongs to the next flow of the core
 	local mix, size = #args.sizes > 1, args.sizes[1]
-	local mem = memory.createMemPool{n = 8191, func = not mix and function(buf) fill(buf, size) end or nil}
+	local multi = mix or #flows > 1
+	local mem = memory.createMemPool{n = 8191, func = not multi and function(buf) filler(flows[1])(buf, size) end or nil}
 	local bufs = mem:bufArray(args.burst)
-	local tmpl = mix and ipsec.mixTemplates(args.sizes, bufs, fill)
+	local tmpls, poss, seqps = {}, {}, {}
+	if multi then
+		for j, flow in ipairs(flows) do
+			tmpls[j], poss[j], seqps[j] = ipsec.mixTemplates(args.sizes, bufs, filler(flow)), ffi.new("uint16_t[1]"), ffi.new("uint64_t[1]")
+		end
+	end
+	local cur = 1
 	local allocSize = math.max(unpack(args.sizes))
-	local pos, seqp = ffi.new("uint16_t[1]"), ffi.new("uint64_t[1]")
 	local seq = 0
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
@@ -99,7 +128,7 @@ function txSlave(queue, flow, args)
 	local start = mg.getTime()
 	-- the achieved rate is measured from the change to the fixed schedule on; all cores reach the full rate after the
 	-- ramp, and with --ramp-stagger each core changes later by its index times the stagger
-	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp + flow * (args.ramp_stagger or 0) * 1e-3 or start, 0
+	local fullStart, fullSeq = args.ramp > 0 and start + args.ramp + core * (args.ramp_stagger or 0) * 1e-3 or start, 0
 	local ramping = args.ramp > 0
 	-- diagnosis of the send schedule: largest backlog, when it occurred (seconds after the start)
 	-- and the number of phases in which the task was more than 0.1 ms behind and caught up at full speed
@@ -133,8 +162,9 @@ function txSlave(queue, flow, args)
 			nextSend = math.max(nextSend, now - 0.01) + interval
 		end
 		bufs:alloc(allocSize)
-		if mix then
-			ipsec.fillMix(bufs, bufs.size, tmpl, pos, seqp)
+		if multi then
+			ipsec.fillMix(bufs, bufs.size, tmpls[cur], poss[cur], seqps[cur])
+			cur = cur % #flows + 1
 			seq = seq + bufs.size
 		else
 			for _, buf in ipairs(bufs) do
@@ -147,7 +177,7 @@ function txSlave(queue, flow, args)
 	end
 	local rate = (seq - fullSeq) / (mg.getTime() - fullStart) / 1e6
 	if rate < 0.99 * args.rate / args.cores then
-		log:warn("Flow %d: reached only %.2f of %.2f Mpps", flow, rate, args.rate / args.cores)
+		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.cores)
 	end
 	return seq, rate, maxLag, maxLagAt, phases
 end

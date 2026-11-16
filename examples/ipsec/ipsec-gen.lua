@@ -2,7 +2,7 @@
 --- One TX queue, one core and one outbound SA per core; SA i uses SPI spiBase + i
 --- and outer source IP tunnelSrc + i, so the receiver's RSS spreads the SAs over its queues.
 --- With --tx-sas n the n SAs are dealt out to the cores in turn (SA i to core i mod cores), and every core uses its
---- SAs in turn, one burst each.
+--- SAs in turn, one burst each. With --sa-file the SAs of the file are dealt out in the same way.
 --- The inner UDP payload is the generator payload of ipsec-sw.lua (flow i = SA i, sequence number per flow), so
 --- that plain-sink.lua can check the traffic after a device in between has decrypted it.
 --- ./build/MoonGen examples/ipsec/ipsec-gen.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <txDev> -c 4 -s 60
@@ -17,7 +17,7 @@ local ipsec  = require "ipsec-sw"
 function configure(parser)
 	parser:description("Generates ESP/AES-GCM encrypted UDP traffic (rte_ipsec + CPU crypto), one SA per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
-	parser:option("-c --cores", "Number of TX cores (= queues = SAs)."):default(1):convert(tonumber)
+	parser:option("-c --cores", "Number of TX cores (= queues), default 1; with --sa-file default: one per SA of the file."):convert(tonumber)
 	parser:option("--tx-sas", "Number of outbound SAs, at least --cores, dealt out to the cores; default: --cores."):convert(tonumber)
 	parser:option("-s --size", "Inner packet size (Ethernet frame without CRC) before encryption, at least 60, or imix (ipsec.IMIX)."):default("60")
 	parser:option("-b --bits", "AES key length (128 or 256), ignored if --key is given."):default(256):convert(tonumber)
@@ -27,7 +27,7 @@ function configure(parser)
 	parser:option("--tunnel-src", "Outer source IP of the first SA (incremented per SA)."):default("192.168.0.1")
 	parser:option("--tunnel-dst", "Outer destination IP."):default("192.168.1.1")
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
-	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --cores, --key, --spi-base and the addresses.")
+	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --tx-sas, --key, --spi-base and the addresses.")
 	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
@@ -44,8 +44,10 @@ function master(args)
 	args.key = args.key or ipsec.testKey(args.bits)
 	if args.sa_file then
 		args.saList = ipsec.loadSaFile(args.sa_file, "out")
-		args.cores = #args.saList
+		if args.tx_sas and args.tx_sas ~= #args.saList then log:fatal("--tx-sas does not go with --sa-file") end
+		args.tx_sas = #args.saList
 	end
+	args.cores = args.cores or (args.saList and #args.saList or 1)
 	-- nothing is received here: all incoming frames stay with the kernel (ARP, IKE)
 	ipsec.isolate(args.txDev)
 	local txDev = device.config{port = args.txDev, txQueues = args.cores, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
@@ -71,7 +73,6 @@ end
 --- (also used by ipsec-transceiver.lua).
 function txSetup(args)
 	args.sizes = ipsec.sizes(args.size)
-	if args.saList and args.tx_sas ~= args.cores then log:fatal("--tx-sas does not go with --sa-file") end
 	if args.tx_sas < args.cores or args.tx_sas > ipsec.MAX_FLOWS then log:fatal("--tx-sas must be between --cores and %d (payload flows)", ipsec.MAX_FLOWS) end
 	args.txStart = mg.getTime() + args.tx_delay
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold
@@ -95,6 +96,7 @@ end
 local function coreSpis(args, core)
 	local n = math.floor((args.tx_sas - 1 - core) / args.cores) + 1
 	if n == 1 then return "SPI " .. coreSa(args, core).spi end
+	if args.saList then return ("%d SAs from the SA file"):format(n) end
 	return ("%d SAs, SPIs %d..%d in steps of %d"):format(n, coreSa(args, core).spi, coreSa(args, core + (n - 1) * args.cores).spi, args.cores)
 end
 
