@@ -27,8 +27,9 @@ ffi.cdef[[
 
 	int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket);
 	struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
-		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn,
+		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn, uint64_t seq_start,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket);
+	uint64_t mg_ipsec_sa_next_seq(const struct mg_ipsec_sa* s);
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
 	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint64_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
@@ -127,13 +128,15 @@ end
 ---   srcMac, dstMac  Ethernet addresses of the encrypted frames (outbound tunnel mode)
 ---   replayWindow    anti-replay window size for inbound SAs (default 64, 0 disables)
 ---   esn         true: extended (64 bit) sequence numbers
+---   seqStart    sequence number to continue from (mod.loadSeqFile): outbound the first one sent, inbound the
+---               highest one received so far (top of the replay window); default: from the start
 function mod.createSa(args)
 	local outbound = args.dir == "out"
 	local tunnel = (args.mode or "tunnel") == "tunnel"
 	local key, keyLen = mod.parseKey(args.key)
 	local srcMac, dstMac = mac(args.srcMac), mac(args.dstMac)
 	local sa = C.mg_ipsec_sa_create(outbound and 1 or 0, tunnel and 1 or 0, args.spi,
-		key, keyLen, args.replayWindow or 64, args.esn and 1 or 0,
+		key, keyLen, args.replayWindow or 64, args.esn and 1 or 0, args.seqStart or 0,
 		tunnel and ip4(args.src) or 0, tunnel and ip4(args.dst) or 0,
 		srcMac, dstMac, args.socket or 0)
 	if sa == nil then
@@ -291,6 +294,59 @@ function mod.loadSaFile(path, dir)
 		log:fatal("No \"%s\" SAs in SA file %s", dir, path)
 	end
 	return list
+end
+
+--- Sequence numbers to continue on SAs that a peer keeps across runs (a DUT that negotiated them by IKE), one line per
+--- SA: "out SPI NEXT" = the number the next packet sent on the outbound SA gets, "in SPI LAST" = the highest number
+--- received on the inbound SA (top of its replay window, from which the upper 32 bits of extended sequence numbers
+--- are inferred). A missing file or SA means: from the start.
+--- @return table { out = { [SPI as string] = NEXT }, ["in"] = { [SPI as string] = LAST } }
+function mod.loadSeqFile(path)
+	local seqs = { out = {}, ["in"] = {} }
+	local file = io.open(path)
+	if not file then return seqs end
+	for line in file:lines() do
+		local dir, spi, n = line:match("^%s*(%a+)%s+(%d+)%s+(%d+)")
+		if seqs[dir] then seqs[dir][spi] = tonumber(n) end
+	end
+	file:close()
+	return seqs
+end
+
+--- Merge the lines "out SPI NEXT" / "in SPI LAST" (from mod.nextSeqs and mod.lastSeqs) into the sequence file: the
+--- transmit and the receive tasks write their own SAs, the entries of the others stay.
+function mod.saveSeqFile(path, lines)
+	local seqs = mod.loadSeqFile(path)
+	for dir, spi, n in lines:gmatch("(%a+) (%d+) (%d+)") do
+		seqs[dir][spi] = tonumber(n)
+	end
+	local file = io.open(path, "w")
+	if not file then log:fatal("Could not write sequence file %s", path) end
+	for _, dir in ipairs({ "out", "in" }) do
+		for spi, n in pairs(seqs[dir]) do
+			file:write(("%s %s %d\n"):format(dir, spi, n))
+		end
+	end
+	file:close()
+end
+
+--- "out SPI NEXT" lines of the outbound SAs sas[1..n] with their SPIs spis[1..n], for mod.saveSeqFile.
+function mod.nextSeqs(sas, spis)
+	local t = {}
+	for j = 1, #sas do
+		t[j] = ("out %d %d\n"):format(spis[j], tonumber(C.mg_ipsec_sa_next_seq(sas[j])))
+	end
+	return table.concat(t)
+end
+
+--- "in SPI LAST" lines of the inbound SAs sas[1..n] that received packets, for mod.saveSeqFile.
+function mod.lastSeqs(sas, spis)
+	local t = {}
+	for j = 1, #sas do
+		local seen, _, last = mod.rxRange(sas[j])
+		if seen > 0 then t[#t + 1] = ("in %d %d\n"):format(spis[j], last) end
+	end
+	return table.concat(t)
 end
 
 --- Create an SA lookup table indexed by SPI - spiBase for mod.rxDecrypt.

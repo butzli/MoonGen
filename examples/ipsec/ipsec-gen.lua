@@ -29,6 +29,7 @@ function configure(parser)
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
 	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile; replaces --tx-sas, --key, --spi-base and the addresses.")
 	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
+	parser:option("--seq-file", "Continue the ESP sequence numbers of an earlier run on the same SAs: read the next number per SPI from this file at the start (missing file or SPI: from 1) and write them back at the end, see ipsec.loadSeqFile; for a peer that keeps the SAs across runs.")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--burst", "Burst size."):default(64):convert(tonumber)
 	parser:option("-t --time", "Send time at the full rate in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
@@ -75,6 +76,7 @@ function txSetup(args)
 	args.sizes = ipsec.sizes(args.size)
 	if args.tx_sas < args.cores or args.tx_sas > ipsec.MAX_FLOWS then log:fatal("--tx-sas must be between --cores and %d (payload flows)", ipsec.MAX_FLOWS) end
 	args.txStart = mg.getTime() + args.tx_delay
+	if args.seq_file then args.seqStart = ipsec.loadSeqFile(args.seq_file) end
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold
 	-- caches and, in ipsec-transceiver.lua, while the transmit tasks of its own process are starting
 	if args.rate <= 0 then args.ramp = 0 end
@@ -102,13 +104,15 @@ end
 
 --- Waits for the transmit tasks and prints their results (also used by ipsec-transceiver.lua).
 function txSummary(tasks, args)
-	local fails, sent, rate = 0, 0, 0
+	local fails, sent, rate, seqs = 0, 0, 0, {}
 	for i = 0, args.cores - 1 do
-		local f, s, r, lag, lagAt, phases = tasks[i]:wait()
+		local f, s, r, lag, lagAt, phases, nexts = tasks[i]:wait()
+		seqs[#seqs + 1] = nexts
 		log:info("Core %d: %s, packets sent %d, largest backlog %.3f ms at %.2f s, catch-up phases %d", i, coreSpis(args, i), s, lag * 1e3, lagAt, phases)
 		fails, sent, rate = fails + f, sent + s, rate + r
 	end
 	log:info("Encryption failures: %d, packets sent: %d, rate %.2f Mpps", fails, sent, rate)
+	if args.seq_file then ipsec.saveSeqFile(args.seq_file, table.concat(seqs)) end
 end
 
 function txSlave(queue, core, args)
@@ -120,11 +124,12 @@ function txSlave(queue, core, args)
 	local mix, size = #args.sizes > 1, args.sizes[1]
 	local allocSize = math.max(unpack(args.sizes))
 	local pos = ffi.new("uint16_t[1]")
-	local nSas, sas, tmpls, seqs = 0, {}, {}, {}
+	local nSas, sas, tmpls, seqs, spis = 0, {}, {}, {}, {}
 	for i = core, args.tx_sas - 1, args.cores do
 		nSas = nSas + 1
 		local j = nSas
 		local entry = coreSa(args, i)
+		spis[j] = entry.spi
 		sas[j] = ipsec.createSa{
 			dir = "out",
 			mode = args.mode,
@@ -133,6 +138,7 @@ function txSlave(queue, core, args)
 			src = entry.src,
 			dst = entry.dst,
 			esn = entry.esn,
+			seqStart = args.seqStart and args.seqStart.out[tostring(entry.spi)],
 			srcMac = queue.dev:getMacString(),
 			dstMac = args.dst_mac,
 			socket = select(2, mg.getCore()),
@@ -225,5 +231,5 @@ function txSlave(queue, core, args)
 	if rate < 0.99 * args.rate / args.cores then
 		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.cores)
 	end
-	return tonumber(fails[0]), sent, rate, maxLag, maxLagAt, phases
+	return tonumber(fails[0]), sent, rate, maxLag, maxLagAt, phases, ipsec.nextSeqs(sas, spis)
 end

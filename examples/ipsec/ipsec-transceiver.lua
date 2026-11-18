@@ -36,6 +36,7 @@ function configure(parser)
 	parser:option("--dst-mac", "Destination MAC of the encrypted frames."):default("ff:ff:ff:ff:ff:ff")
 	parser:option("--sa-file", "SAs set up elsewhere (e.g. by IKE), see ipsec.loadSaFile, dealt out to the TX cores like --tx-sas; replaces --tx-sas, --sas, --key, --spi-base and the addresses.")
 	parser:flag("--esn", "Extended (64 bit) sequence numbers; with --sa-file each SA says so itself.")
+	parser:option("--seq-file", "Continue the ESP sequence numbers of an earlier run on the same SAs (see ipsec-gen.lua).")
 	parser:option("-r --rate", "Total send rate in Mpps, 0 = as fast as possible."):default(0):convert(tonumber)
 	parser:option("--replay-window", "Anti-replay window size, 0 disables the check."):default(64):convert(tonumber)
 	parser:option("--burst", "Burst size of the senders."):default(64):convert(tonumber)
@@ -82,7 +83,7 @@ function master(args)
 	-- the two nodes do not start at the same instant: the senders wait tx_delay before they start and the
 	-- receivers run rx_linger longer than the senders, so that neither end of the run shows up as loss
 	txSetup(tx)
-	rx.txStart = tx.txStart
+	rx.txStart, rx.seqStart = tx.txStart, tx.seqStart
 	-- receivers first, so that they are ready when the peer and the own senders start
 	local rxTasks, txTasks = {}, {}
 	for i = 0, args.rx_cores - 1 do

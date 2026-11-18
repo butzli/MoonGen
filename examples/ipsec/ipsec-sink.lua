@@ -67,9 +67,10 @@ end
 
 --- Waits for the receive tasks and prints their results (also used by ipsec-transceiver.lua).
 function rxSummary(tasks, args, rxDev)
-	local total, flows = {0, 0, 0, 0, 0, 0, 0}, {}
+	local total, flows, seqs = {0, 0, 0, 0, 0, 0, 0}, {}, {}
 	for i = 0, args.cores - 1 do
-		local res, gap, gapAt, fl = tasks[i]:wait()
+		local res, gap, gapAt, fl, lasts = tasks[i]:wait()
+		seqs[#seqs + 1] = lasts
 		for k, v in ipairs(res) do
 			total[k] = total[k] + v
 		end
@@ -78,6 +79,7 @@ function rxSummary(tasks, args, rxDev)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
 	ipsec.flowSummary(flows, args.cores, "Payload: ")
+	if args.seq_file then ipsec.saveSeqFile(args.seq_file, table.concat(seqs)) end
 	local nic = rxDev:getStats()
 	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
@@ -108,6 +110,7 @@ function rxSlave(queue, core, args)
 			dst = entry.dst,
 			esn = entry.esn,
 			replayWindow = args.replay_window,
+			seqStart = args.seqStart and args.seqStart["in"][tostring(entry.spi)],
 			socket = select(2, mg.getCore()),
 		}
 		spis[i + 1] = entry.spi
@@ -152,5 +155,5 @@ function rxSlave(queue, core, args)
 		end
 	end
 	res[#FIELDS + 1] = missing
-	return res, maxGap, maxGapAt, ipsec.flowResults(flows)
+	return res, maxGap, maxGapAt, ipsec.flowResults(flows), ipsec.lastSeqs(sas, spis)
 end

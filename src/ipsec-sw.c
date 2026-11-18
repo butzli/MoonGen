@@ -39,6 +39,9 @@ struct mg_ipsec_sa {
 	uint64_t first_seq;           // ESP sequence number of the first/last packet received for this SA, extended
 	uint64_t last_seq;            // to 64 bits across wraps of the 32 bits in the packet (see mg_ipsec_rx_decrypt)
 	uint64_t seen;                 // packets received for this SA (before replay check and decryption)
+	uint64_t next_seq;            // outbound: ESP sequence number of the next packet (mg_ipsec_sa_next_seq)
+	uint64_t rx_base;             // inbound: highest sequence number received in an earlier run (seq_start), from which
+	                              // the 64-bit numbers of mg_ipsec_rx_decrypt continue
 };
 
 struct mg_ipsec_rx_stats {
@@ -188,8 +191,12 @@ int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket) {
 // replay_win = 0 disables the anti-replay check (inbound only).
 // esn: extended (64 bit) sequence numbers, RFC 4303: the packets still carry the low 32 bits only, the high
 // 32 bits are part of the authenticated data.
+// seq_start, so that a run continues an earlier one on the same SA (0 = from the start): outbound, the sequence number
+// of the first packet (a peer that keeps the SA would otherwise drop the packets as replays); inbound, the highest one
+// received so far, i.e. the top of the replay window, from which the upper 32 bits of extended sequence numbers are
+// inferred (otherwise every packet fails the ICV check once the peer's numbers have passed 2^32).
 struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
-		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn,
+		const uint8_t* key, uint32_t key_len, uint32_t replay_win, int esn, uint64_t seq_start,
 		uint32_t src_ip, uint32_t dst_ip, const uint8_t* src_mac, const uint8_t* dst_mac, int socket) {
 	if (mg_cdev_id < 0) {
 		printf("[ipsec] mg_ipsec_init() has not been called\n");
@@ -225,6 +232,10 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	prm.ipsec_xform.mode = tunnel ? RTE_SECURITY_IPSEC_SA_MODE_TUNNEL : RTE_SECURITY_IPSEC_SA_MODE_TRANSPORT;
 	prm.ipsec_xform.replay_win_sz = outbound ? 0 : replay_win;
 	prm.ipsec_xform.options.esn = esn != 0;
+	// outbound: the first sequence number (rte_ipsec starts at 1 for 0 and 1); inbound: the top of the replay window
+	prm.ipsec_xform.esn.value = seq_start;
+	s->next_seq = seq_start > 1 ? seq_start : 1;
+	s->rx_base = outbound ? 0 : seq_start;
 	prm.crypto_xform = &xf;
 
 	if (tunnel) {
@@ -286,6 +297,11 @@ err:
 	return NULL;
 }
 
+// Outbound: sequence number the next packet of this SA would get, for seq_start of a later run.
+uint64_t mg_ipsec_sa_next_seq(const struct mg_ipsec_sa* s) {
+	return s->next_seq;
+}
+
 void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s) {
 	if (!s) return;
 	rte_cryptodev_sym_session_free(mg_cdev_id, s->ss.crypto.ses);
@@ -324,7 +340,9 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 		}
 		*seq = q;
 	}
+	// prepare gives every packet of the burst the next sequence number, also those that fail later
 	uint16_t k = rte_ipsec_pkt_cpu_prepare(&s->ss, mb, n);
+	s->next_seq += k;
 	k = rte_ipsec_pkt_process(&s->ss, mb, k);
 	if (k < n) {
 		*fails += n - k;
@@ -430,12 +448,14 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 			continue;
 		}
 		uint32_t seq = rte_be_to_cpu_32(esph->seq);
+		// the packet carries only the low 32 bits: step from the previous one (for the first packet, from the
+		// highest number of an earlier run, rx_base) by their signed difference, so that a wrap counts on in the
+		// upper bits instead of jumping back (as ESN infers the high bits)
 		if (!sas[sa_idx]->seen++) {
-			sas[sa_idx]->first_seq = seq;
-			sas[sa_idx]->last_seq = seq;
+			uint64_t base = sas[sa_idx]->rx_base;
+			sas[sa_idx]->last_seq = base ? base + (int32_t)(seq - (uint32_t)base) : seq;
+			sas[sa_idx]->first_seq = sas[sa_idx]->last_seq;
 		} else {
-			// the packet carries only the low 32 bits: step from the previous one by their signed difference,
-			// so that a wrap counts on in the upper bits instead of jumping back (as ESN infers the high bits)
 			sas[sa_idx]->last_seq += (int32_t)(seq - (uint32_t)sas[sa_idx]->last_seq);
 		}
 		esp[n_esp] = m;
