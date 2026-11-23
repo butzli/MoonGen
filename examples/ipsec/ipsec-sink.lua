@@ -1,6 +1,6 @@
 --- ESP (AES-GCM) receiver/decoder, counterpart of ipsec-gen.lua.
---- One rte_flow rule per SA steers SPI spiBase + i to RX queue i mod cores, so every SA is always handled
---- by the same core (the anti-replay state is never shared) and the SAs are spread evenly over the cores.
+--- One rte_flow rule per SA steers SPI spiBase + i to RX queue i mod cores, so every SA is always handled by the same
+--- core (the anti-replay state is never shared) and the SAs are spread evenly over the cores.
 --- With --rss the NIC distributes by RSS hash of the outer IPs instead (uneven for few SAs).
 --- Every core decrypts, authenticates and counts the packets of its queue and checks the generator payload of the
 --- decrypted packets (ipsec-sw.lua): per flow, gaps and reordering end to end, also of traffic that a device in
@@ -13,9 +13,11 @@ local stats  = require "stats"
 local log    = require "log"
 local ipsec  = require "ipsec-sw"
 
+-- result line of a receive queue and of the total, and the fields of struct mg_ipsec_rx_stats in the same order
 local SUMMARY = "received %d, decrypted+authenticated %d, auth/ICV failures %d, replay/malformed drops %d, unknown SPI %d, non-ESP %d"
 local FIELDS  = {"rx_pkts", "ok_pkts", "auth_fails", "prepare_drops", "unknown_spi", "non_esp"}
 
+--- Command line options.
 function configure(parser)
 	parser:description("Receives, decrypts and verifies ESP/AES-GCM traffic from ipsec-gen.lua.")
 	parser:argument("rxDev", "Device to receive from."):convert(tonumber)
@@ -37,8 +39,11 @@ function configure(parser)
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
 end
 
+--- Configures the port, the crypto device and the flow rules, starts one receive task per core, shows the RX rate of
+--- the port until the end of the run and then prints the results of the tasks.
 function master(args)
 	args.key = args.key or ipsec.testKey(args.bits)
+	-- --sa-file: the inbound SAs of the file, their number replaces --sas
 	if args.sa_file then
 		args.saList = ipsec.loadSaFile(args.sa_file, "in")
 		args.sas = #args.saList
@@ -47,15 +52,19 @@ function master(args)
 	if not args.rss then ipsec.isolate(args.rxDev) end
 	local rxDev = device.config{port = args.rxDev, rxQueues = args.cores, rssQueues = args.cores, rxDescs = args.rx_descs, disableOffloads = not args.offloads}
 	device.waitForLinks()
+	-- every core has its own instance of every SA (rxSlave)
 	ipsec.init(args.cores * args.sas)
+	-- one flow rule per SA: SA i to queue i mod cores (none with --rss)
 	for i = 0, args.rss and -1 or args.sas - 1 do
 		ipsec.steerSpi(rxDev:getRxQueue(i % args.cores), rxSa(args, i).spi)
 	end
 	if args.time > 0 then mg.setRuntime(args.time) end
+	-- one receive task per core, each on its own RX queue
 	local tasks = {}
 	for i = 0, args.cores - 1 do
 		tasks[i] = mg.startTask("rxSlave", rxDev:getRxQueue(i), i, args)
 	end
+	-- RX rate of the port every 10 ms until the end of the run (--time or Ctrl+C)
 	local ctr = stats:newDevRxCounter(rxDev, "plain")
 	while mg.running() do
 		ctr:update()
@@ -68,6 +77,8 @@ end
 --- Waits for the receive tasks and prints their results (also used by ipsec-transceiver.lua).
 function rxSummary(tasks, args, rxDev)
 	local total, flows, seqs = {0, 0, 0, 0, 0, 0, 0}, {}, {}
+	-- per queue: its counters added to the total, its flows and the "in SPI LAST" lines of its SAs collected, and its
+	-- longest stall
 	for i = 0, args.cores - 1 do
 		local res, gap, gapAt, fl, lasts = tasks[i]:wait()
 		seqs[#seqs + 1] = lasts
@@ -78,8 +89,10 @@ function rxSummary(tasks, args, rxDev)
 		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
+	-- per flow of the generator payload, over all queues
 	ipsec.flowSummary(flows, args.cores, "Payload: ")
 	if args.seq_file then ipsec.saveSeqFile(args.seq_file, table.concat(seqs)) end
+	-- counters of the port: imissed = dropped because the RX queue was full
 	local nic = rxDev:getStats()
 	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
@@ -96,6 +109,9 @@ function rxSa(args, i)
 	}
 end
 
+--- Receive task of one core: receives, decrypts and checks the packets of its queue until the end of the run (plus
+--- rx_linger). Returns the counters in the order of FIELDS plus the packets missing between the sequence numbers, the
+--- longest stall, the flow results and the "in SPI LAST" lines of its SAs.
 function rxSlave(queue, core, args)
 	-- own inbound SA instances for all SPIs; only those arriving on this queue are ever used
 	local sas, spis = {}, {}
@@ -131,12 +147,14 @@ function rxSlave(queue, core, args)
 	-- in seconds after the start of the senders (ipsec-transceiver.lua) or after the first second of this task
 	local last = mg.getTime()
 	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
+	-- one burst per pass: receive, decrypt, count, check, free
 	while mg.running(linger) do
 		ipsec.rxDecrypt(queue, bufs, saTable, numSas, spiBase, st, flows, args.mode)
 		local now = mg.getTime()
 		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
 		last = now
 	end
+	-- the counters of the queue in the order of FIELDS
 	local res = {}
 	for i, k in ipairs(FIELDS) do
 		res[i] = tonumber(st[k])
@@ -147,6 +165,7 @@ function rxSlave(queue, core, args)
 	local missing = 0
 	for i, sa in ipairs(sas) do
 		local seen, first, last = ipsec.rxRange(sa)
+		-- only the SAs that arrived on this queue
 		if seen > 0 then
 			local gap = last - first + 1 - seen
 			log:info("Queue %d: SPI %d: ESP sequence numbers %d..%d, received %d, missing in between %d",

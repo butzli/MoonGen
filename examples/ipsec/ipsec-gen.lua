@@ -1,6 +1,6 @@
 --- ESP (AES-GCM) traffic generator, counterpart of ipsec-sink.lua.
---- One TX queue, one core and one outbound SA per core; SA i uses SPI spiBase + i
---- and outer source IP tunnelSrc + i, so the receiver's RSS spreads the SAs over its queues.
+--- One TX queue, one core and one outbound SA per core; SA i uses SPI spiBase + i and outer source IP tunnelSrc + i,
+--- so the receiver's RSS spreads the SAs over its queues.
 --- With --tx-sas n the n SAs are dealt out to the cores in turn (SA i to core i mod cores), and every core uses its
 --- SAs in turn, one burst each. With --sa-file the SAs of the file are dealt out in the same way.
 --- The inner UDP payload is the generator payload of ipsec-sw.lua (flow i = SA i, sequence number per flow), so
@@ -14,6 +14,7 @@ local log    = require "log"
 local ffi    = require "ffi"
 local ipsec  = require "ipsec-sw"
 
+--- Command line options.
 function configure(parser)
 	parser:description("Generates ESP/AES-GCM encrypted UDP traffic (rte_ipsec + CPU crypto), one SA per core.")
 	parser:argument("txDev", "Device to transmit from."):convert(tonumber)
@@ -40,27 +41,36 @@ function configure(parser)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
 end
 
+--- Configures the port and the crypto device, starts one transmit task per core, shows the TX rate of the port until
+--- the end of the run and then prints the results of the tasks.
 function master(args)
 	if args.mode ~= "tunnel" and args.mode ~= "transport" then log:fatal("Mode must be tunnel or transport") end
 	args.key = args.key or ipsec.testKey(args.bits)
+	-- --sa-file: the outbound SAs of the file, their number replaces --tx-sas
 	if args.sa_file then
 		args.saList = ipsec.loadSaFile(args.sa_file, "out")
 		if args.tx_sas and args.tx_sas ~= #args.saList then log:fatal("--tx-sas does not go with --sa-file") end
 		args.tx_sas = #args.saList
 	end
+	-- default: one core per SA of the file, without a file one core
 	args.cores = args.cores or (args.saList and #args.saList or 1)
 	-- nothing is received here: all incoming frames stay with the kernel (ARP, IKE)
 	ipsec.isolate(args.txDev)
+	-- send on timestamp only for --nic-pacing with a rate limit; the PTP clock of the port gives the pacer the time of
+	-- the NIC
 	local txDev = device.config{port = args.txDev, txQueues = args.cores, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
 	args.ptp = ipsec.ptpClock(args.txDev)
 	device.waitForLinks()
+	-- without --tx-sas one SA per core; the session pool of the crypto device holds all of them
 	args.tx_sas = args.tx_sas or args.cores
 	ipsec.init(args.tx_sas)
 	txSetup(args)
+	-- one transmit task per core, each on its own TX queue
 	local tasks = {}
 	for i = 0, args.cores - 1 do
 		tasks[i] = mg.startTask("txSlave", txDev:getTxQueue(i), i, args)
 	end
+	-- TX rate of the port every 10 ms until the end of the run (--time or Ctrl+C)
 	local ctr = stats:newDevTxCounter(txDev, "plain")
 	while mg.running() do
 		ctr:update()
@@ -73,13 +83,17 @@ end
 --- Fixes the start of the senders and the run time; to be called once before the transmit tasks are started
 --- (also used by ipsec-transceiver.lua).
 function txSetup(args)
+	-- the frame sizes of --size: one, or the pattern of imix
 	args.sizes = ipsec.sizes(args.size)
 	if args.tx_sas < args.cores or args.tx_sas > ipsec.MAX_FLOWS then log:fatal("--tx-sas must be between --cores and %d (payload flows)", ipsec.MAX_FLOWS) end
+	-- common start time of all transmit tasks
 	args.txStart = mg.getTime() + args.tx_delay
+	-- --seq-file: the sequence numbers of the earlier run, per SPI
 	if args.seq_file then args.seqStart = ipsec.loadSeqFile(args.seq_file) end
 	-- with a rate limit the senders start slowly, so that the receiver does not meet the full rate with cold
 	-- caches and, in ipsec-transceiver.lua, while the transmit tasks of its own process are starting
 	if args.rate <= 0 then args.ramp = 0 end
+	-- --time counts at the full rate: the run also covers the delay and the ramp
 	if args.time > 0 then mg.setRuntime(args.tx_delay + args.ramp + args.time) end
 end
 
@@ -96,8 +110,10 @@ end
 
 --- SPI(s) of a core for the log.
 local function coreSpis(args, core)
+	-- the core has the SAs core, core + cores, ... below tx_sas
 	local n = math.floor((args.tx_sas - 1 - core) / args.cores) + 1
 	if n == 1 then return "SPI " .. coreSa(args, core).spi end
+	-- the SPIs of an SA file follow no pattern: only their number
 	if args.saList then return ("%d SAs from the SA file"):format(n) end
 	return ("%d SAs, SPIs %d..%d in steps of %d"):format(n, coreSa(args, core).spi, coreSa(args, core + (n - 1) * args.cores).spi, args.cores)
 end
@@ -105,6 +121,7 @@ end
 --- Waits for the transmit tasks and prints their results (also used by ipsec-transceiver.lua).
 function txSummary(tasks, args)
 	local fails, sent, rate, seqs = 0, 0, 0, {}
+	-- per core: one line with its results; the next sequence numbers of its SAs are collected for --seq-file
 	for i = 0, args.cores - 1 do
 		local f, s, r, lag, lagAt, phases, nexts = tasks[i]:wait()
 		seqs[#seqs + 1] = nexts
@@ -115,6 +132,9 @@ function txSummary(tasks, args)
 	if args.seq_file then ipsec.saveSeqFile(args.seq_file, table.concat(seqs)) end
 end
 
+--- Transmit task of one core: encrypts and sends bursts of its SAs in turn, on a fixed schedule with a rate limit,
+--- otherwise as fast as possible. Returns the encryption failures, the packets sent, the rate reached, the diagnosis
+--- of the schedule and the "out SPI NEXT" lines of its SAs.
 function txSlave(queue, core, args)
 	local mem = memory.createMemPool{n = 8191}
 	local bufs = mem:bufArray(args.burst)
@@ -122,6 +142,7 @@ function txSlave(queue, core, args)
 	-- from it before each use) and the sequence number of its flow in the inner payload, written into every packet
 	-- by ipsec.encrypt; with a size mix (imix) one template per size, used in the order of the pattern
 	local mix, size = #args.sizes > 1, args.sizes[1]
+	-- the mbufs are allocated for the largest size; pos = position in the size pattern
 	local allocSize = math.max(unpack(args.sizes))
 	local pos = ffi.new("uint16_t[1]")
 	local nSas, sas, tmpls, seqs, spis = 0, {}, {}, {}, {}
@@ -143,6 +164,8 @@ function txSlave(queue, core, args)
 			dstMac = args.dst_mac,
 			socket = select(2, mg.getCore()),
 		}
+		-- inner UDP packet of SA i with len bytes and the payload of flow i; inner addresses from the SA file, without
+		-- one 10.0.0.1 + i -> 10.1.0.1
 		local function fill(buf, len)
 			local pkt = buf:getUdpPacket()
 			pkt:fill{
@@ -161,11 +184,14 @@ function txSlave(queue, core, args)
 		tmpls[j] = mix and ipsec.mixTemplates(args.sizes, bufs, fill) or ipsec.template(bufs, size, fill)
 		seqs[j] = ffi.new("uint64_t[1]")
 	end
+	-- the SA of the next burst (number cur) with its template and flow sequence number
 	local cur, sa, tmpl, seq = 1, sas[1], tmpls[1], seqs[1]
 	local fails = ffi.new("uint64_t[1]")
+	-- the first burst sent logs the frame sizes
 	local first = true
 	-- rate limit: the bursts follow a fixed schedule; a backlog of more than 10 ms is dropped instead of caught up
 	local interval = args.rate > 0 and args.burst * args.cores / (args.rate * 1e6) or 0
+	-- wait for the common start time (--tx-delay)
 	while mg.running() and mg.getTime() < args.txStart do
 		mg.sleepMillis(1)
 	end
@@ -182,34 +208,45 @@ function txSlave(queue, core, args)
 	local pacer = (args.nic_pacing or 0) > 0 and interval > 0 and ipsec.newPacer(args.ptp, args.nic_pacing * 1e-6, args.pacing_group)
 	local lead = pacer and pacer.lead or 0
 	local nextSend = start
+	-- one burst per pass until the end of the run
 	while mg.running() do
+		-- busy wait until the burst is due; due = its time in the schedule
 		while mg.getTime() < nextSend - lead do end
 		local due = nextSend
 		local now = mg.getTime() + lead
+		-- with a rate limit: backlog behind the schedule for the diagnosis
 		if interval > 0 then
 			local lag = now - nextSend
 			if lag > maxLag then maxLag, maxLagAt = lag, now - args.txStart end
+			-- a new catch-up phase begins when the task falls more than 0.1 ms behind
 			if lag > 0.0001 then
 				if not behind then behind, phases = true, phases + 1 end
 			else
 				behind = false
 			end
 		end
+		-- time of the next burst
 		if ramping then
 			if now >= fullStart then
+				-- end of the ramp of this core: fixed schedule from here on, the achieved rate counts from now
 				ramping, fullStart, fullSent = false, now, sent
 				nextSend = math.max(nextSend, now - 0.01) + interval
 			else
+				-- ramp: the rate rises with the elapsed share of the ramp, from at least 1 % of the full rate
 				nextSend = now + interval / math.max(math.min((now - start) / args.ramp, 1), 0.01)
 			end
 		else
+			-- fixed schedule; at most 10 ms of backlog is caught up
 			nextSend = math.max(nextSend, now - 0.01) + interval
 		end
+		-- several SAs: the next one in turn
 		if nSas > 1 then
 			cur = cur % nSas + 1
 			sa, tmpl, seq = sas[cur], tmpls[cur], seqs[cur]
 		end
 		bufs:alloc(allocSize)
+		-- fill and encrypt: a size mix is copied from its templates first, a single size is filled by ipsec.encrypt
+		-- itself from the template, together with the sequence numbers
 		local n
 		if mix then
 			ipsec.fillMix(bufs, bufs.size, tmpl, pos, seq)
@@ -217,16 +254,20 @@ function txSlave(queue, core, args)
 		else
 			n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, size, fails, seq)
 		end
+		-- send the n packets that were encrypted (ipsec.encrypt has freed the others)
 		if n > 0 then
 			if first then
 				first = false
 				log:info("Core %d: %s, inner frame %s B -> ESP frame %d B%s", core, coreSpis(args, core), args.size, bufs.array[0].pkt_len, mix and " (first one)" or "")
 			end
+			-- --nic-pacing: send times spaced evenly from due up to the next burst
 			if pacer then pacer:stamp(bufs, n, due, (nextSend - due) / bufs.size) end
 			queue:sendN(bufs, n)
 			sent = sent + n
 		end
 	end
+	-- rate since the change to the fixed schedule; below 99 % of the share of this core the run counts as not reached
+	-- (the pos-scripts count these warnings)
 	local rate = (sent - fullSent) / (mg.getTime() - fullStart) / 1e6
 	if rate < 0.99 * args.rate / args.cores then
 		log:warn("Core %d: reached only %.2f of %.2f Mpps", core, rate, args.rate / args.cores)

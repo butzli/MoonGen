@@ -9,10 +9,12 @@
 
 local ffi = require "ffi"
 local log = require "log"
-require "filter" -- rte_flow declarations
+-- rte_flow declarations
+require "filter"
 
 local C = ffi.C
 
+-- functions and structs of src/ipsec-sw.c, described there
 ffi.cdef[[
 	struct mg_ipsec_sa;
 
@@ -57,6 +59,7 @@ ffi.cdef[[
 
 local mod = {}
 
+-- crypto vdev of the DPDK config (examples/ipsec/dpdk-conf.lua)
 mod.defaultCryptoDev = "crypto_aesni_gcm0"
 
 --- Initialize the crypto device. Call once in master() before starting tasks.
@@ -79,6 +82,7 @@ function mod.parseKey(hex)
 	if len ~= 20 and len ~= 36 then
 		log:fatal("IPsec key must be 16 or 32 bytes AES key + 4 bytes salt (40 or 72 hex chars), got %d bytes", len)
 	end
+	-- two hex digits per byte
 	local buf = ffi.new("uint8_t[?]", len)
 	for i = 0, len - 1 do
 		buf[i] = tonumber(hex:sub(2 * i + 1, 2 * i + 2), 16)
@@ -98,12 +102,14 @@ local function ip4(str)
 	if not ip then
 		log:fatal("Invalid IPv4 address %s", tostring(str))
 	end
+	-- negative: the same address as unsigned 32-bit number
 	if ip < 0 then
 		ip = ip + 2^32
 	end
 	return ip
 end
 
+-- MAC address string as byte array, nil stays nil (no MAC given)
 local function mac(str)
 	if not str then
 		return nil
@@ -135,6 +141,7 @@ function mod.createSa(args)
 	local tunnel = (args.mode or "tunnel") == "tunnel"
 	local key, keyLen = mod.parseKey(args.key)
 	local srcMac, dstMac = mac(args.srcMac), mac(args.dstMac)
+	-- the outer addresses only count in tunnel mode
 	local sa = C.mg_ipsec_sa_create(outbound and 1 or 0, tunnel and 1 or 0, args.spi,
 		key, keyLen, args.replayWindow or 64, args.esn and 1 or 0, args.seqStart or 0,
 		tunnel and ip4(args.src) or 0, tunnel and ip4(args.dst) or 0,
@@ -157,18 +164,21 @@ end
 --- either receiver checks the traffic of either generator, also after a device in between has en- or decrypted it:
 --- magic (uint32) | send time (uint32, reserved, 0) | sequence number of the flow (uint64) | flow (uint16)
 --- = 18 bytes, which fills a 60 byte frame (see struct mg_payload in src/ipsec-sw.c).
-mod.PAYLOAD_MAGIC = 0x504c4149 -- "PLAI"
+-- magic = "PLAI"
+mod.PAYLOAD_MAGIC = 0x504c4149
 mod.MIN_FRAME = 60
 mod.MAX_FLOWS = 4096
 
 --- Write the constant part of the payload (all but the sequence number) into a UDP packet.
 function mod.fillPayload(udpPkt, flow)
+	-- magic and send time as uint32 0 and 1, the flow as uint16 8 (bytes 16-17)
 	local p = udpPkt.payload
 	p.uint32[0], p.uint32[1], p.uint16[8] = mod.PAYLOAD_MAGIC, 0, flow
 end
 
 --- Write the sequence number into the payload of a UDP packet.
 function mod.setPayloadSeq(udpPkt, seq)
+	-- uint64 1 = bytes 8-15
 	udpPkt.payload.uint64[1] = seq
 end
 
@@ -181,6 +191,7 @@ mod.IMIX = { 60, 566, 60, 60, 566, 60, 1460, 60, 566, 60, 60, 566 }
 --- The packet sizes of the value of a generator's size option: { n } for a number n, mod.IMIX for "imix".
 function mod.sizes(s)
 	if s == "imix" then return mod.IMIX end
+	-- a number: one size, at least the minimum frame for the payload
 	local n = tonumber(s)
 	if not n or n < mod.MIN_FRAME then log:fatal("Packet size must be at least %d (generator payload) or imix", mod.MIN_FRAME) end
 	return { n }
@@ -189,6 +200,7 @@ end
 --- Packet template of len bytes: fill(buf, len) fills the first buffer of bufs, which is then copied.
 function mod.template(bufs, len, fill)
 	bufs:alloc(len)
+	-- fill the first buffer, copy it into the template and give the buffers back
 	fill(bufs[1], len)
 	local t = ffi.new("uint8_t[?]", len)
 	ffi.copy(t, bufs[1]:getData(), len)
@@ -199,6 +211,7 @@ end
 --- Templates of a size pattern (mod.sizes) for mod.fillMix, one per distinct size (see mod.template).
 function mod.mixTemplates(sizes, bufs, fill)
 	local mix = { n = #sizes, ptrs = ffi.new("const uint8_t*[?]", #sizes), lens = ffi.new("uint16_t[?]", #sizes), bySize = {} }
+	-- one template per distinct size, shared by all positions of the pattern with that size
 	for i, len in ipairs(sizes) do
 		mix.bySize[len] = mix.bySize[len] or mod.template(bufs, len, fill)
 		mix.ptrs[i - 1], mix.lens[i - 1] = mix.bySize[len], len
@@ -221,6 +234,7 @@ end
 --- @return { other = n, flows = { [id] = { rx, lost, late } } }
 function mod.flowResults(fl)
 	local res = { other = tonumber(fl.other), flows = {} }
+	-- only the flows seen on this queue
 	for id = 0, mod.MAX_FLOWS - 1 do
 		local f = fl.f[id]
 		if f.rx > 0 then
@@ -234,6 +248,7 @@ end
 --- one line per flow with the queue(s) it arrived on and one line with the totals, both starting with prefix.
 --- @return totals { flows, rx, lost, late, split, other }
 function mod.flowSummary(res, queues, prefix)
+	-- merge the flows of all queues; ids lists every flow once, sorted below
 	local flows, ids, other = {}, {}, 0
 	for q = 0, queues - 1 do
 		other = other + res[q].other
@@ -247,6 +262,7 @@ function mod.flowSummary(res, queues, prefix)
 		end
 	end
 	table.sort(ids)
+	-- one line per flow, summed up in total; split = flows that arrived on more than one queue
 	local total = { flows = #ids, rx = 0, lost = 0, late = 0, split = 0, other = other }
 	for _, id in ipairs(ids) do
 		local e = flows[id]
@@ -272,15 +288,19 @@ function mod.loadSaFile(path, dir)
 		log:fatal("Could not open SA file %s", path)
 	end
 	local list = {}
+	-- per line: its words without the comment
 	for line in file:lines() do
 		local f = {}
 		for word in line:gsub("#.*", ""):gmatch("%S+") do
 			f[#f + 1] = word
 		end
+		-- "esn" as last word: flag of the SA, not an address
 		local esn = f[#f] == "esn"
 		if esn then
 			f[#f] = nil
 		end
+		-- an SA line (direction, numeric SPI, key and both outer addresses) is kept if it has the requested direction;
+		-- any other line that is not empty after removing the comment is an error
 		if #f >= 5 and (f[1] == "out" or f[1] == "in") and tonumber(f[2]) then
 			if f[1] == dir then
 				list[#list + 1] = { spi = tonumber(f[2]), key = f[3], src = f[4], dst = f[5], innerSrc = f[6], innerDst = f[7], esn = esn }
@@ -305,6 +325,7 @@ function mod.loadSeqFile(path)
 	local seqs = { out = {}, ["in"] = {} }
 	local file = io.open(path)
 	if not file then return seqs end
+	-- lines "out|in SPI N"; other lines are skipped
 	for line in file:lines() do
 		local dir, spi, n = line:match("^%s*(%a+)%s+(%d+)%s+(%d+)")
 		if seqs[dir] then seqs[dir][spi] = tonumber(n) end
@@ -316,12 +337,14 @@ end
 --- Merge the lines "out SPI NEXT" / "in SPI LAST" (from mod.nextSeqs and mod.lastSeqs) into the sequence file: the
 --- transmit and the receive tasks write their own SAs, the entries of the others stay.
 function mod.saveSeqFile(path, lines)
+	-- the entries of the file, overwritten by the lines of the caller
 	local seqs = mod.loadSeqFile(path)
 	for dir, spi, n in lines:gmatch("(%a+) (%d+) (%d+)") do
 		seqs[dir][spi] = tonumber(n)
 	end
 	local file = io.open(path, "w")
 	if not file then log:fatal("Could not write sequence file %s", path) end
+	-- the whole file again, out before in
 	for _, dir in ipairs({ "out", "in" }) do
 		for spi, n in pairs(seqs[dir]) do
 			file:write(("%s %s %d\n"):format(dir, spi, n))
@@ -363,11 +386,13 @@ end
 --- @param spis the SPIs of the SAs, in the same order
 --- @return table, number of slots (= numSas of mod.rxDecrypt)
 function mod.createSpiTable(sas, spis)
+	-- the smallest power of two that is at least twice the number of SAs
 	local slots = 2
 	while slots < 2 * #sas do
 		slots = slots * 2
 	end
 	local tbl = ffi.new("struct mg_ipsec_sa*[?]", slots)
+	-- each SA in the first free slot from the low bits of its SPI on
 	for i, sa in ipairs(sas) do
 		local slot = bit.band(spis[i], slots - 1)
 		while tbl[slot] ~= nil do
@@ -381,6 +406,7 @@ end
 -- One rte_flow rule in the NIC: IPv4 packets matching the optional IPv4 and ESP items go to rxQueue.
 local function steer(rxQueue, what, ip, esp)
 	local attr = ffi.new("struct rte_flow_attr", { ingress = 1 })
+	-- pattern ETH / IPV4 (with ip) / ESP (with esp) / END; without esp the pattern ends after IPV4
 	local items = ffi.new("struct rte_flow_item[4]")
 	items[0].type = C.RTE_FLOW_ITEM_TYPE_ETH
 	items[1].type = C.RTE_FLOW_ITEM_TYPE_IPV4
@@ -388,6 +414,7 @@ local function steer(rxQueue, what, ip, esp)
 	items[2].type = esp and C.RTE_FLOW_ITEM_TYPE_ESP or C.RTE_FLOW_ITEM_TYPE_END
 	if esp then items[2].spec, items[2].mask = esp[1], esp[2] end
 	items[3].type = C.RTE_FLOW_ITEM_TYPE_END
+	-- action: to the queue, then END
 	local queue = ffi.new("struct rte_flow_action_queue", { index = rxQueue.qid })
 	local actions = ffi.new("struct rte_flow_action[2]")
 	actions[0].type, actions[0].conf = C.RTE_FLOW_ACTION_TYPE_QUEUE, queue
@@ -413,7 +440,8 @@ end
 --- Unlike RSS this does not depend on the IP addresses, so every SA gets a defined core.
 function mod.steerSpi(rxQueue, spi)
 	local spec, mask = ffi.new("struct rte_flow_item_esp"), ffi.new("struct rte_flow_item_esp")
-	spec.hdr.spi = bit.bswap(spi) % 2^32 -- network byte order
+	-- network byte order
+	spec.hdr.spi = bit.bswap(spi) % 2^32
 	mask.hdr.spi = 0xffffffff
 	steer(rxQueue, "SPI " .. spi, nil, { spec, mask })
 end
@@ -421,7 +449,8 @@ end
 --- Steer all IPv4 packets with the given source address to one RX queue (for the cleartext flows).
 function mod.steerSrcIp(rxQueue, ip)
 	local spec, mask = ffi.new("struct rte_flow_item_ipv4"), ffi.new("struct rte_flow_item_ipv4")
-	spec.hdr.src_addr = bit.bswap(ip4(ip)) % 2^32 -- network byte order
+	-- network byte order
+	spec.hdr.src_addr = bit.bswap(ip4(ip)) % 2^32
 	mask.hdr.src_addr = 0xffffffff
 	steer(rxQueue, "source IP " .. tostring(ip), { spec, mask })
 end
@@ -434,13 +463,15 @@ function mod.rxRange(sa)
 	return seen, tonumber(range[0]), tonumber(range[1])
 end
 
+--- Receive counters of one queue for mod.rxDecrypt (struct mg_ipsec_rx_stats).
 function mod.newRxStats()
 	return ffi.new("struct mg_ipsec_rx_stats")
 end
 
+-- length of the Ethernet header, offset of the inner IPv4 header in transport mode
+local ETH_HDR_LEN = 14
 --- Receive, decrypt, count and free one burst; with flows (mod.newFlows) also check the payload of the decrypted
 --- packets, whose inner IPv4 header starts at offset 0 in tunnel mode and after the Ethernet header in transport mode.
-local ETH_HDR_LEN = 14
 function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats, flows, mode)
 	return C.mg_ipsec_rx_decrypt(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, saTable, numSas, spiBase, stats, flows,
 		mode == "transport" and ETH_HDR_LEN or 0)
@@ -456,14 +487,17 @@ end
 -- The transmit loop hands each burst over a lead time ahead of its time in the schedule, and the packets of the
 -- burst get times spaced evenly over the interval up to the next burst; the NIC thereby interleaves the packets of
 -- all transmit queues instead of sending each burst back to back at line rate.
+-- in a pcall: another module may have declared these already, and a second declaration fails
 pcall(ffi.cdef, [[
 	int open(const char* pathname, int flags);
 	int rte_eth_dev_get_name_by_port(uint16_t port_id, char* name);
 ]])
-require "utils" -- clock_gettime
+-- clock_gettime
+require "utils"
 
 --- Device file of the PTP clock of a DPDK port (PCI devices only), e.g. /dev/ptp5; to be called in the master.
 function mod.ptpClock(port)
+	-- the PCI device of the port lists its PTP clock under ptp/ in sysfs
 	local name = ffi.new("char[64]")
 	if C.rte_eth_dev_get_name_by_port(port, name) ~= 0 then return nil end
 	local ls = io.popen("ls /sys/bus/pci/devices/" .. ffi.string(name) .. "/ptp 2>/dev/null")
@@ -472,6 +506,7 @@ function mod.ptpClock(port)
 	return ptp and "/dev/" .. ptp
 end
 
+-- methods of the objects of mod.newPacer
 local pacer = {}
 pacer.__index = pacer
 
@@ -479,6 +514,7 @@ pacer.__index = pacer
 --- carries a time and the ones in between follow it back to back (the NIC needs an extra work request per time).
 function mod.newPacer(clock, lead, group)
 	local dpdkc = require "dpdkc"
+	-- the PTP clock opened read-only, -1 without one
 	local fd = clock and C.open(clock, 0) or -1
 	local self = setmetatable({
 		-- mbuf field and flag of the send time, registered by libmoon's device.config with sendOnTimestamp
@@ -494,12 +530,15 @@ function mod.newPacer(clock, lead, group)
 	if self.off < 0 or fd < 0 then
 		log:fatal("NIC pacing needs a device configured with sendOnTimestamp and its PTP clock (%s)", tostring(clock))
 	end
+	-- the first pair of times
 	self:calibrate()
 	return self
 end
 
 --- Pair of mg.getTime (s) and NIC clock (ns, uint64) from the shortest of five reads (a read takes about 1.5 us).
 function pacer:calibrate()
+	-- the NIC clock read between two reads of mg.getTime; the shortest span gives the best pair, with the NIC time
+	-- taken at the middle of the span
 	local best = math.huge
 	for _ = 1, 5 do
 		local t0 = self.getTime()
@@ -518,6 +557,7 @@ end
 --- Send times for the first n packets of bufs: due (mg.getTime) for the first one, then every spacing seconds.
 function pacer:stamp(bufs, n, due, spacing)
 	if due > self.nextCal then self:calibrate() end
+	-- base and step in ns from the calibration point; every group-th packet gets its send time and the flag
 	local base, step = (due - self.t) * 1e9, spacing * 1e9
 	for i = 0, n - 1, self.group do
 		local m = bufs.array[i]

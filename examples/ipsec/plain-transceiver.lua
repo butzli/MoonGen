@@ -4,8 +4,8 @@
 --- then runs ipsec-transceiver.lua.
 --- Sending: one TX queue, one core and one flow per TX core; flow i goes from src + i to dst (with --tx-flows: more
 --- flows than TX cores, with --vary dst: from src to dst + i, see plain-gen.lua).
---- Receiving: one rte_flow rule per flow steers source address rxSrc + i to RX queue i mod rxCores (with --rss:
---- RSS hash instead). Both sides carry the same generator payload (ipsec-sw.lua), so the receivers also check the
+--- Receiving: one rte_flow rule per flow steers source address rxSrc + i to RX queue i mod rxCores (with --rss: RSS
+--- hash instead). Both sides carry the same generator payload (ipsec-sw.lua), so the receivers also check the
 --- traffic of ipsec-gen.lua after the device has decrypted it; packets without it are counted per queue as other.
 --- Like ipsec-transceiver.lua, only the receive offloads are switched off.
 --- Node A: ./build/MoonGen examples/ipsec/plain-transceiver.lua <dev> --tx-cores 4 --rx-cores 4
@@ -15,12 +15,14 @@ local mg     = require "moongen"
 local device = require "device"
 local stats  = require "stats"
 local log    = require "log"
-local ipsec  = require "ipsec-sw" -- flow rules, isolated mode and generator payload
+-- ipsec-sw.lua: flow rules, isolated mode, generator payload and NIC pacing
+local ipsec  = require "ipsec-sw"
 -- txSlave and txSummary come from plain-gen.lua, rxSlave and rxSummary from plain-sink.lua;
 -- configure and master of these two files are replaced by the ones below
 require "plain-gen"
 require "plain-sink"
 
+--- Command line options.
 function configure(parser)
 	parser:description("Sends cleartext UDP traffic with per-flow sequence numbers and receives and verifies the traffic of its peer on the same port.")
 	parser:argument("dev", "Device to transmit from and receive on."):convert(tonumber)
@@ -48,12 +50,18 @@ function configure(parser)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(1):convert(tonumber)
 end
 
+--- Configures the port and the flow rules, starts the receive and then the transmit tasks, shows the rates of the port
+--- until the end of the run and then prints the results of both kinds of task.
 function master(args)
+	-- the frame sizes of --size: one, or the pattern of imix
 	args.sizes = ipsec.sizes(args.size)
 	checkFlows(args, args.tx_cores)
+	-- default: the peer sends as many flows as this node
 	args.flows = args.flows or args.tx_flows
 	-- only the flows steered below are received, the rest stays with the kernel (ARP); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
+	-- send on timestamp only for --nic-pacing with a rate limit; the PTP clock of the port gives the pacer the time of
+	-- the NIC
 	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
 	args.ptp = ipsec.ptpClock(args.dev)
 	device.waitForLinks()
@@ -64,6 +72,7 @@ function master(args)
 	end
 	tx.cores = args.tx_cores
 	rx.cores, rx.burst = args.rx_cores, args.rx_burst
+	-- one flow rule per flow received: source rx_src + i to RX queue i mod rx_cores (none with --rss)
 	for i = 0, args.rss and -1 or args.flows - 1 do
 		ipsec.steerSrcIp(dev:getRxQueue(i % args.rx_cores), parseIP4Address(args.rx_src) + i)
 	end
@@ -82,6 +91,7 @@ function master(args)
 	for i = 0, args.tx_cores - 1 do
 		txTasks[i] = mg.startTask("txSlave", dev:getTxQueue(i), i, tx)
 	end
+	-- TX and RX rate of the port every 10 ms until the end of the run (--time or Ctrl+C)
 	local txCtr = stats:newDevTxCounter(dev, "plain")
 	local rxCtr = stats:newDevRxCounter(dev, "plain")
 	while mg.running() do

@@ -7,13 +7,16 @@ local log    = require "log"
 local ffi    = require "ffi"
 local ipsec  = require "ipsec-sw"
 
+-- packets per test
 local N = 32
 
+--- Command line options.
 function configure(parser)
 	parser:description("Self test for the software IPsec path (rte_ipsec + CPU crypto).")
 	parser:option("-s --size", "Inner packet size."):default(60):convert(tonumber)
 end
 
+--- Number of failed checks; check logs one check as PASS or FAIL and counts the failures.
 local failed = 0
 local function check(cond, fmt, ...)
 	if cond then
@@ -24,17 +27,20 @@ local function check(cond, fmt, ...)
 	end
 end
 
+--- All checks for one mode (tunnel or transport) and key length: N packets through an outbound and an inbound SA with
+--- the same SPI and key, compared with the plaintext; then one tampered and one replayed packet, which must be
+--- rejected.
 local function runMode(mode, bits, size, spi)
 	local key = ipsec.testKey(bits)
 	local out = ipsec.createSa{dir = "out", mode = mode, spi = spi, key = key, src = "192.168.0.1", dst = "192.168.1.1", srcMac = "02:00:00:00:00:01", dstMac = "02:00:00:00:00:02"}
 	local inb = ipsec.createSa{dir = "in", mode = mode, spi = spi, key = key, src = "192.168.0.1", dst = "192.168.1.1", replayWindow = 64}
-
+	-- mempool whose buffers hold one inner UDP packet of size bytes
 	local mem = memory.createMemPool{n = 1023, func = function(buf)
 		buf:getUdpPacket():fill{ethSrc = "02:00:00:00:00:01", ethDst = "02:00:00:00:00:02", ip4Src = "10.0.0.1", ip4Dst = "10.1.0.1", pktLength = size}
 	end}
 	local bufs = mem:bufArray(N)
 	bufs:alloc(size)
-	-- distinct payload per packet, keep plaintext copies for comparison
+	-- distinct payload per packet (UDP source port = packet number), keep plaintext copies for comparison
 	local plain = {}
 	for i = 0, N - 1 do
 		local pkt = bufs[i + 1]:getUdpPacket()
@@ -43,10 +49,10 @@ local function runMode(mode, bits, size, spi)
 		pkt.udp:setSrcPort(i)
 		plain[i] = ffi.string(bufs[i + 1]:getData(), size)
 	end
+	-- encrypt all N in place
 	local fails = ffi.new("uint64_t[1]")
 	local n = ipsec.encrypt(out, bufs, N, nil, 0, fails)
 	check(n == N, "[%s/AES-%d] encrypted %d/%d packets, frame %d -> %d B", mode, bits, n, N, size, bufs.array[0].pkt_len)
-
 	-- keep copies of two encrypted packets for the tamper and replay tests
 	local extra = mem:bufArray(2)
 	extra:alloc(size)
@@ -56,11 +62,12 @@ local function runMode(mode, bits, size, spi)
 		extra.array[i].pkt_len = len
 		extra.array[i].data_len = len
 	end
-
+	-- decrypt all N in place
 	local prepOk = ffi.new("uint16_t[1]")
 	local ok = ffi.C.mg_ipsec_decrypt_burst(inb, bufs.array, N, prepOk)
 	check(ok == N, "[%s/AES-%d] decrypted+authenticated %d/%d packets", mode, bits, ok, N)
-	-- compare everything from the inner UDP header on (IP header fields may legitimately change)
+	-- compare everything from the inner UDP header on (IP header fields may legitimately change); a decrypted packet
+	-- starts with the inner IPv4 header in tunnel mode and with the Ethernet header in transport mode (l2)
 	local l2 = mode == "tunnel" and 0 or 14
 	local match = 0
 	for i = 0, ok - 1 do
@@ -70,8 +77,8 @@ local function runMode(mode, bits, size, spi)
 		end
 	end
 	check(match == N, "[%s/AES-%d] %d/%d decrypted packets match the plaintext", mode, bits, match, N)
-
-	-- extra[1]: flip one ciphertext byte of a copy of packet 0 -> replayed SQN; use packet 1 copy for tampering
+	-- tamper test: extra[2], the copy of packet 1, gets one encrypted byte flipped, 20 bytes before the end (in front
+	-- of the 16-byte ICV); packet 0 has been accepted by inb, so its copy extra[1] serves as the replay
 	local tampered = extra[2]:getData()
 	local tlen = extra.array[1].pkt_len
 	ffi.cast("uint8_t*", tampered)[tlen - 20] = bit.bxor(ffi.cast("uint8_t*", tampered)[tlen - 20], 0xff)
@@ -80,12 +87,12 @@ local function runMode(mode, bits, size, spi)
 	local one = ffi.new("struct rte_mbuf*[1]")
 	one[0] = extra.array[1]
 	local okT = ffi.C.mg_ipsec_decrypt_burst(inb2, one, 1, prepOk)
+	-- passes the replay check (prepOk 1), fails the ICV check (ok 0)
 	check(okT == 0 and prepOk[0] == 1, "[%s/AES-%d] tampered packet rejected by ICV check", mode, bits)
-
+	-- replay test: rejected before decryption (prepOk 0)
 	one[0] = extra.array[0]
 	local okR = ffi.C.mg_ipsec_decrypt_burst(inb, one, 1, prepOk)
 	check(okR == 0 and prepOk[0] == 0, "[%s/AES-%d] replayed packet rejected by anti-replay window", mode, bits)
-
 	bufs:freeAll()
 	extra:freeAll()
 	ffi.C.mg_ipsec_sa_destroy(out)
@@ -93,6 +100,7 @@ local function runMode(mode, bits, size, spi)
 	ffi.C.mg_ipsec_sa_destroy(inb2)
 end
 
+--- Runs the checks for tunnel and transport mode with AES-128 and AES-256, one SPI each, and prints the result.
 function master(args)
 	ipsec.init(64)
 	local spi = 1

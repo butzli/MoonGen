@@ -1,8 +1,7 @@
 // Software IPsec (ESP, AES-GCM) for MoonGen.
-// Thin glue around DPDK's rte_ipsec library using synchronous CPU crypto
-// (RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO), e.g. with the ipsec_mb based
-// crypto_aesni_gcm vdev. All ESP processing (header, IV, SQN, padding,
-// trailer, ICV, tunnel encap/decap, anti-replay) is done by rte_ipsec.
+// Thin glue around DPDK's rte_ipsec library using synchronous CPU crypto (RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO), e.g.
+// with the ipsec_mb based crypto_aesni_gcm vdev. All ESP processing (header, IV, SQN, padding, trailer, ICV, tunnel
+// encap/decap, anti-replay) is done by rte_ipsec.
 // Also holds the receive path of the cleartext programs (mg_plain_rx) and the check of the generator payload per flow,
 // which both kinds of receiver share.
 
@@ -23,12 +22,14 @@
 #include <rte_security.h>
 #include <rte_ipsec.h>
 
+// lengths of the Ethernet header and of the AES-GCM fields; largest receive burst (size of the arrays on the stack)
 #define MG_IPSEC_ETH_LEN     14
 #define MG_IPSEC_GCM_IV_LEN  12
 #define MG_IPSEC_GCM_ICV_LEN 16
 #define MG_IPSEC_GCM_AAD_LEN 8
 #define MG_IPSEC_MAX_BURST   256
 
+// One SA: the session of rte_ipsec with its SA, the header template of tunnel mode and the counters of this module.
 struct mg_ipsec_sa {
 	struct rte_ipsec_session ss;   // must stay first, Lua passes this pointer around
 	struct rte_ipsec_sa* sa;
@@ -44,6 +45,7 @@ struct mg_ipsec_sa {
 	                              // the 64-bit numbers of mg_ipsec_rx_decrypt continue
 };
 
+// Receive counters of one queue (mg_ipsec_rx_decrypt).
 struct mg_ipsec_rx_stats {
 	uint64_t rx_pkts;       // all received frames
 	uint64_t ok_pkts;       // successfully decrypted and authenticated
@@ -80,6 +82,7 @@ struct mg_flows {
 	struct mg_flow f[MG_FLOWS_MAX];
 };
 
+// The crypto device of mg_ipsec_init (-1 before) and the pool of the crypto sessions of all SAs.
 static int mg_cdev_id = -1;
 static struct rte_mempool* mg_sess_pool;
 
@@ -92,6 +95,7 @@ static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n
 		struct rte_mbuf* m = mb[i];
 		const uint8_t* ip = rte_pktmbuf_mtod_offset(m, const uint8_t*, l3_off);
 		const struct mg_payload* p;
+		// fast path: long enough, IPv4 without options, UDP; otherwise IPv4 with options and UDP; anything else: other
 		if (likely(m->data_len >= fast_len && ip[0] == RTE_IPV4_VHL_DEF && ip[9] == IPPROTO_UDP)) {
 			p = (const struct mg_payload*) (ip + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr));
 		} else {
@@ -107,6 +111,7 @@ static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n
 			}
 			p = rte_pktmbuf_mtod_offset(m, const struct mg_payload*, off);
 		}
+		// without the magic or with a flow id out of range the packet does not come from the generators
 		uint16_t id = p->flow;
 		if (unlikely(p->magic != MG_PAYLOAD_MAGIC || id >= MG_FLOWS_MAX)) {
 			fl->other++;
@@ -121,6 +126,7 @@ static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n
 		}
 		f->rx++;
 		if (likely(seq >= f->exp)) {
+			// in order, or after a gap that counts as missing
 			f->lost += seq - f->exp;
 			f->exp = seq + 1;
 		} else {
@@ -146,6 +152,7 @@ uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16
 // Must be called once from the main task before any SA is created.
 // Returns the crypto device id or a negative value on error.
 int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket) {
+	// already initialized: the same device
 	if (mg_cdev_id >= 0) {
 		return mg_cdev_id;
 	}
@@ -154,18 +161,21 @@ int mg_ipsec_init(const char* cdev_name, uint32_t max_sessions, int socket) {
 		printf("[ipsec] crypto device %s not found (missing --vdev=%s or libipsec-mb-dev at build time?)\n", cdev_name, cdev_name);
 		return -1;
 	}
+	// rte_ipsec with CPU crypto needs a device that processes synchronously on the calling core
 	struct rte_cryptodev_info info;
 	rte_cryptodev_info_get(dev_id, &info);
 	if (!(info.feature_flags & RTE_CRYPTODEV_FF_SYM_CPU_CRYPTO)) {
 		printf("[ipsec] crypto device %s does not support CPU crypto\n", cdev_name);
 		return -1;
 	}
+	// one session per SA
 	uint32_t sess_size = rte_cryptodev_sym_get_private_session_size(dev_id);
 	mg_sess_pool = rte_cryptodev_sym_session_pool_create("mg_ipsec_sess", max_sessions, sess_size, 0, 0, socket);
 	if (!mg_sess_pool) {
 		printf("[ipsec] could not create session pool\n");
 		return -1;
 	}
+	// one queue pair, needed to start the device; with CPU crypto the packets do not pass through it
 	struct rte_cryptodev_config conf = {
 		.socket_id = socket,
 		.nb_queue_pairs = 1,
@@ -210,6 +220,8 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	s->tunnel = tunnel;
 	s->spi = spi;
 
+	// AEAD transform: AES-GCM, 16-byte ICV, AAD = SPI + sequence number (8 bytes), with ESN 4 bytes more for the high
+	// half of the sequence number
 	struct rte_crypto_sym_xform xf = {
 		.type = RTE_CRYPTO_SYM_XFORM_AEAD,
 		.next = NULL,
@@ -223,6 +235,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 		},
 	};
 
+	// parameters of the rte_ipsec SA: SPI, salt (the 4 bytes after the key), direction, mode, replay window, ESN
 	struct rte_ipsec_sa_prm prm;
 	memset(&prm, 0, sizeof(prm));
 	prm.ipsec_xform.spi = spi;
@@ -238,6 +251,8 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	s->rx_base = outbound ? 0 : seq_start;
 	prm.crypto_xform = &xf;
 
+	// tunnel mode: header template Ethernet + outer IPv4, which rte_ipsec puts in front of every encrypted packet
+	// (total length set by rte_ipsec, checksum by the NIC); transport mode: the protected packet is IPv4
 	if (tunnel) {
 		struct rte_ether_hdr* eth = (struct rte_ether_hdr*) s->hdr;
 		struct rte_ipv4_hdr* ip = (struct rte_ipv4_hdr*) (s->hdr + MG_IPSEC_ETH_LEN);
@@ -261,6 +276,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 		prm.trs.proto = IPPROTO_IPIP;
 	}
 
+	// the rte_ipsec SA in memory of the size it needs for these parameters
 	int size = rte_ipsec_sa_size(&prm);
 	if (size < 0) {
 		printf("[ipsec] rte_ipsec_sa_size failed: %d\n", size);
@@ -275,6 +291,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 		printf("[ipsec] rte_ipsec_sa_init failed: %d\n", rc);
 		goto err;
 	}
+	// session of the SA: CPU crypto on the crypto device, then prepared for rte_ipsec_pkt_cpu_prepare and _process
 	s->ss.sa = s->sa;
 	s->ss.type = RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO;
 	s->ss.crypto.dev_id = mg_cdev_id;
@@ -290,6 +307,7 @@ struct mg_ipsec_sa* mg_ipsec_sa_create(int outbound, int tunnel, uint32_t spi,
 	}
 	return s;
 
+	// error: free what has been allocated (s is zeroed, so pointers not yet set are NULL)
 err:
 	if (s->ss.crypto.ses) rte_cryptodev_sym_session_free(mg_cdev_id, s->ss.crypto.ses);
 	if (s->sa) rte_free(s->sa);
@@ -302,6 +320,7 @@ uint64_t mg_ipsec_sa_next_seq(const struct mg_ipsec_sa* s) {
 	return s->next_seq;
 }
 
+// Free an SA with its crypto session and its rte_ipsec SA.
 void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s) {
 	if (!s) return;
 	rte_cryptodev_sym_session_free(mg_cdev_id, s->ss.crypto.ses);
@@ -320,12 +339,14 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails) {
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf* m = mb[i];
+		// re-filled from the template: the whole buffer, starting after the headroom
 		if (tmpl) {
 			m->data_off = RTE_PKTMBUF_HEADROOM;
 			rte_memcpy(rte_pktmbuf_mtod(m, void*), tmpl, tmpl_len);
 			m->data_len = tmpl_len;
 			m->pkt_len = tmpl_len;
 		}
+		// header lengths for rte_ipsec
 		m->l2_len = MG_IPSEC_ETH_LEN;
 		m->l3_len = sizeof(struct rte_ipv4_hdr);
 		// outer (tunnel) or modified (transport) IPv4 header checksum is computed by the NIC
@@ -344,6 +365,7 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 	uint16_t k = rte_ipsec_pkt_cpu_prepare(&s->ss, mb, n);
 	s->next_seq += k;
 	k = rte_ipsec_pkt_process(&s->ss, mb, k);
+	// the packets that failed are counted and freed
 	if (k < n) {
 		*fails += n - k;
 		rte_pktmbuf_free_bulk(mb + k, n - k);
@@ -366,6 +388,7 @@ void mg_fill_mix(struct rte_mbuf** mb, uint16_t n, const uint8_t* const* tmpls, 
 		m->data_len = lens[k];
 		m->pkt_len = lens[k];
 		rte_pktmbuf_mtod_offset(m, struct mg_payload*, MG_PAYLOAD_OFF)->seq = q++;
+		// next position in the pattern, at the end back to the start
 		if (++k == plen) k = 0;
 	}
 	*pos = k;
@@ -376,11 +399,13 @@ void mg_fill_mix(struct rte_mbuf** mb, uint16_t n, const uint8_t* const* tmpls, 
 // Successfully decrypted packets are at mb[0..ret-1], rejected ones at the end (not freed).
 // n - *prep_ok are replay/malformed rejects, *prep_ok - ret are ICV/trailer failures.
 uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok) {
+	// header lengths for rte_ipsec
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_ipv4_hdr* ip = rte_pktmbuf_mtod_offset(mb[i], struct rte_ipv4_hdr*, MG_IPSEC_ETH_LEN);
 		mb[i]->l2_len = MG_IPSEC_ETH_LEN;
 		mb[i]->l3_len = rte_ipv4_hdr_len(ip);
 	}
+	// prepare rejects replays and malformed packets, process those that fail the ICV check or have an invalid trailer
 	uint16_t k = rte_ipsec_pkt_cpu_prepare(&s->ss, mb, n);
 	*prep_ok = k;
 	return rte_ipsec_pkt_process(&s->ss, mb, k);
@@ -403,6 +428,7 @@ uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint
 uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
 		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st, struct mg_flows* fl,
 		uint16_t l3_off) {
+	// the arrays below hold at most MG_IPSEC_MAX_BURST packets
 	if (burst > MG_IPSEC_MAX_BURST) {
 		burst = MG_IPSEC_MAX_BURST;
 	}
@@ -410,6 +436,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 	if (n == 0) {
 		return 0;
 	}
+	// esp, idx: the ESP packets of the burst and the index of their SA; grp: the packets of one SA
 	struct rte_mbuf* esp[MG_IPSEC_MAX_BURST];
 	struct rte_mbuf* grp[MG_IPSEC_MAX_BURST];
 	uint32_t idx[MG_IPSEC_MAX_BURST];
@@ -420,15 +447,16 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		struct rte_mbuf* m = mb[i];
 		struct rte_ether_hdr* eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr*);
 		struct rte_ipv4_hdr* ip = (struct rte_ipv4_hdr*) (eth + 1);
+		// not IPv4, not ESP or too short for the ESP header
 		if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) || ip->next_proto_id != IPPROTO_ESP
 		 || m->data_len < MG_IPSEC_ETH_LEN + rte_ipv4_hdr_len(ip) + sizeof(struct rte_esp_hdr)) {
 			st->non_esp++;
 			continue;
 		}
-		// The length of the packet is taken from its IP header, not from the NIC: with CQE compression (the default
-		// of the mlx5 PMD), packets of different sizes that arrive densely were delivered with the length of another
-		// packet (2026-11-13: about half of the packets of a size mix then failed the ICV check, none without
-		// compression or with a single size). The data itself is complete in the buffer.
+		// the length of the packet is taken from its IP header, not from the NIC: with CQE compression (the default of
+		// the mlx5 PMD), packets of different sizes that arrive densely are delivered with the length of another packet
+		// (about half of the packets of a size mix then failed the ICV check, none without compression or with a single
+		// size); the data itself is complete in the buffer, so only a length that fits the buffer is taken
 		uint16_t len = MG_IPSEC_ETH_LEN + rte_be_to_cpu_16(ip->total_length);
 		if (len != m->pkt_len && m->nb_segs == 1 && len <= m->buf_len - m->data_off) {
 			m->data_len = len;
@@ -436,6 +464,8 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		}
 		struct rte_esp_hdr* esph = (struct rte_esp_hdr*) ((uint8_t*) ip + rte_ipv4_hdr_len(ip));
 		uint32_t spi = rte_be_to_cpu_32(esph->spi);
+		// SA of the SPI: index SPI - spi_base, or with spi_base = 0 the slot of the hash table (linear probing up to
+		// the SPI or an empty slot)
 		uint32_t sa_idx = spi - spi_base;
 		if (!spi_base) {
 			sa_idx = spi & (nb_sa - 1);
@@ -443,6 +473,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 				sa_idx = (sa_idx + 1) & (nb_sa - 1);
 			}
 		}
+		// out of range or empty slot: no SA for this SPI
 		if (sa_idx >= nb_sa || !sas[sa_idx]) {
 			st->unknown_spi++;
 			continue;
@@ -458,6 +489,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 		} else {
 			sas[sa_idx]->last_seq += (int32_t)(seq - (uint32_t)sas[sa_idx]->last_seq);
 		}
+		// the packet joins the ESP packets of the burst
 		esp[n_esp] = m;
 		idx[n_esp] = sa_idx;
 		n_esp++;
@@ -469,6 +501,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 	for (uint16_t i = 0; i < n_esp; i++) {
 		if (done[i]) continue;
 		uint32_t cur = idx[i];
+		// the packets of the SA of packet i that are not processed yet, in their order
 		uint16_t g = 0;
 		for (uint16_t j = i; j < n_esp; j++) {
 			if (!done[j] && idx[j] == cur) {
@@ -476,6 +509,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 				done[j] = 1;
 			}
 		}
+		// decrypt the group and count the outcome
 		uint16_t prep_ok;
 		uint16_t ok = mg_ipsec_decrypt_burst(sas[cur], grp, g, &prep_ok);
 		st->prepare_drops += g - prep_ok;

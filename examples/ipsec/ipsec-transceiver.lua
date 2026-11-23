@@ -1,11 +1,11 @@
 --- ESP (AES-GCM) generator and receiver/decoder on the same port: the transmit tasks of ipsec-gen.lua and the
 --- receive tasks of ipsec-sink.lua in one process, for bidirectional tests between two nodes that both run this script.
---- Sending: one TX queue, one core and one outbound SA per TX core; SA i uses SPI spiBase + i and outer
---- addresses tunnelLocal + i -> tunnelRemote (with --tx-sas: more SAs than TX cores, see ipsec-gen.lua).
---- Receiving: inbound SAs for the SPIs spiBase + i with outer addresses tunnelRemote + i -> tunnelLocal; one
---- rte_flow rule per SA steers it to RX queue i mod rxCores (with --rss: RSS hash of the outer IPs instead).
---- Only the receive offloads are switched off (ipsec-sink.lua switches off all of them): the NIC has to compute
---- the outer IPv4 checksum of the frames sent.
+--- Sending: one TX queue, one core and one outbound SA per TX core; SA i uses SPI spiBase + i and outer addresses
+--- tunnelLocal + i -> tunnelRemote (with --tx-sas: more SAs than TX cores, see ipsec-gen.lua).
+--- Receiving: inbound SAs for the SPIs spiBase + i with outer addresses tunnelRemote + i -> tunnelLocal; one rte_flow
+--- rule per SA steers it to RX queue i mod rxCores (with --rss: RSS hash of the outer IPs instead).
+--- Only the receive offloads are switched off (ipsec-sink.lua switches off all of them): the NIC has to compute the
+--- outer IPv4 checksum of the frames sent.
 --- Node A: ./build/MoonGen examples/ipsec/ipsec-transceiver.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <dev> --tx-cores 4 --rx-cores 4
 --- Node B: the same with --tunnel-local 192.168.1.1 --tunnel-remote 192.168.0.1
 --- It also works against ipsec-gen.lua and ipsec-sink.lua with their default addresses on node A.
@@ -19,6 +19,7 @@ local ipsec  = require "ipsec-sw"
 require "ipsec-gen"
 require "ipsec-sink"
 
+--- Command line options.
 function configure(parser)
 	parser:description("Sends ESP/AES-GCM encrypted UDP traffic and receives, decrypts and verifies the traffic of its peer on the same port.")
 	parser:argument("dev", "Device to transmit from and receive on."):convert(tonumber)
@@ -52,23 +53,32 @@ function configure(parser)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
 end
 
+--- Configures the port, the crypto device and the flow rules, starts the receive and then the transmit tasks, shows
+--- the rates of the port until the end of the run and then prints the results of both kinds of task.
 function master(args)
 	if args.mode ~= "tunnel" and args.mode ~= "transport" then log:fatal("Mode must be tunnel or transport") end
 	args.key = args.key or ipsec.testKey(args.bits)
+	-- --sa-file: the outbound SAs of the file for the senders, the inbound ones for the receivers; their numbers
+	-- replace --tx-sas and --sas
 	local txSas, rxSas
 	if args.sa_file then
 		txSas, rxSas = ipsec.loadSaFile(args.sa_file, "out"), ipsec.loadSaFile(args.sa_file, "in")
 		if args.tx_sas and args.tx_sas ~= #txSas then log:fatal("--tx-sas does not go with --sa-file") end
 		args.tx_sas, args.sas = #txSas, #rxSas
 	end
+	-- defaults: one TX core per outbound SA of the file (without a file one), one SA per TX core, the peer sends as
+	-- many SAs as this node
 	args.tx_cores = args.tx_cores or (txSas and #txSas or 1)
 	args.tx_sas = args.tx_sas or args.tx_cores
 	args.sas = args.sas or args.tx_sas
 	-- only the SAs steered below are received, the rest stays with the kernel (ARP, IKE); RSS needs all frames
 	if not args.rss then ipsec.isolate(args.dev) end
+	-- send on timestamp only for --nic-pacing with a rate limit; the PTP clock of the port gives the pacer the time of
+	-- the NIC
 	local dev = device.config{port = args.dev, txQueues = args.tx_cores, rxQueues = args.rx_cores, rssQueues = args.rx_cores, rxDescs = args.rx_descs, disableRxOffloads = true, sendOnTimestamp = args.nic_pacing > 0 and args.rate > 0}
 	args.ptp = ipsec.ptpClock(args.dev)
 	device.waitForLinks()
+	-- crypto sessions: one per outbound SA, and one per inbound SA on every receive core (rxSlave)
 	ipsec.init(args.tx_sas + args.rx_cores * args.sas)
 	-- the tasks expect the options under the names of ipsec-gen.lua and ipsec-sink.lua
 	local tx, rx = {}, {}
@@ -77,12 +87,14 @@ function master(args)
 	end
 	tx.cores, tx.tunnel_src, tx.tunnel_dst, tx.saList = args.tx_cores, args.tunnel_local, args.tunnel_remote, txSas
 	rx.cores, rx.tunnel_src, rx.tunnel_dst, rx.burst, rx.saList = args.rx_cores, args.tunnel_remote, args.tunnel_local, args.rx_burst, rxSas
+	-- one flow rule per inbound SA: SA i to RX queue i mod rx_cores (none with --rss)
 	for i = 0, args.rss and -1 or args.sas - 1 do
 		ipsec.steerSpi(dev:getRxQueue(i % args.rx_cores), rxSa(rx, i).spi)
 	end
 	-- the two nodes do not start at the same instant: the senders wait tx_delay before they start and the
 	-- receivers run rx_linger longer than the senders, so that neither end of the run shows up as loss
 	txSetup(tx)
+	-- the receivers measure their stalls from the start of the senders and continue the sequence numbers of --seq-file
 	rx.txStart, rx.seqStart = tx.txStart, tx.seqStart
 	-- receivers first, so that they are ready when the peer and the own senders start
 	local rxTasks, txTasks = {}, {}
@@ -92,6 +104,7 @@ function master(args)
 	for i = 0, args.tx_cores - 1 do
 		txTasks[i] = mg.startTask("txSlave", dev:getTxQueue(i), i, tx)
 	end
+	-- TX and RX rate of the port every 10 ms until the end of the run (--time or Ctrl+C)
 	local txCtr = stats:newDevTxCounter(dev, "plain")
 	local rxCtr = stats:newDevRxCounter(dev, "plain")
 	while mg.running() do
