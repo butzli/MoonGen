@@ -2,14 +2,15 @@
 // Thin glue around DPDK's rte_ipsec library using synchronous CPU crypto (RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO), e.g.
 // with the ipsec_mb based crypto_aesni_gcm vdev. All ESP processing (header, IV, SQN, padding, trailer, ICV, tunnel
 // encap/decap, anti-replay) is done by rte_ipsec.
-// Also holds the receive path of the cleartext programs (mg_plain_rx) and the check of the generator payload per flow,
-// which both kinds of receiver share.
+// Also holds the receive path of the cleartext programs (mg_plain_rx) and the check of the generator payload per flow
+// with the latency measurement, which both kinds of receiver share.
 
 #include <string.h>
 #include <stdio.h>
 
 #include <rte_config.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 #include <rte_malloc.h>
 #include <rte_memcpy.h>
 #include <rte_mbuf.h>
@@ -57,8 +58,13 @@ struct mg_ipsec_rx_stats {
 
 // Payload of the generated packets: the UDP payload of the (inner) packet, the same with and without ESP, so that
 // either receiver checks the traffic of either generator, also after a device in between has en- or decrypted it.
-// magic | send time (reserved, 0) | sequence number of the flow | flow = 18 bytes, which fills a 60 byte frame.
+// magic | send time | sequence number of the flow | flow = 18 bytes, which fills a 60 byte frame.
 // Host byte order; the fields are in this order so that each one is naturally aligned within the payload.
+// Send time (--latency, mg_payload_times): the low 32 bits of the TSC at which the packet leaves, 0 = no time (latency
+// off, or the ramp of the sender). TSC ticks and not nanoseconds: each DPDK process determines the TSC frequency
+// itself, and on absolute times (system uptime) a difference of 1 ppm between sender and receiver would already
+// amount to 0.1 s, while the difference of two TSC readings is exact. Sender and receiver must share the TSC, i.e.
+// run on one node (the two instances on avax); the low 32 bits wrap after about 1.8 s, far above any latency.
 #define MG_PAYLOAD_MAGIC 0x504c4149 // "PLAI"
 #define MG_FLOWS_MAX     4096       // flow ids above are counted as other packets
 struct __rte_packed_begin mg_payload {
@@ -82,14 +88,44 @@ struct mg_flows {
 	struct mg_flow f[MG_FLOWS_MAX];
 };
 
+// Latency of one receive queue (--latency): receive time minus send time of the payload, in TSC ticks, in a
+// log-linear histogram: values below 2^MG_LAT_SUB exactly, above in 2^MG_LAT_SUB steps per power of two (0.1 %
+// relative, about 10 ns at 10 us). The receive time is read once per burst, right after rte_eth_rx_burst.
+#define MG_LAT_SUB     10
+#define MG_LAT_BUCKETS ((32 - MG_LAT_SUB) << MG_LAT_SUB) // covers all values up to 2^31 - 1
+struct mg_lat {
+	uint64_t n;        // packets with a send time and a latency >= 0, in the histogram
+	uint64_t sum;      // sum of their latencies (mean)
+	uint64_t max;      // largest latency
+	uint64_t untimed;  // valid payload without a send time (time 0)
+	uint64_t neg;      // negative latency: sender and receiver do not share the TSC, or a fault
+	uint64_t ipdv_sum; // sum of |latency - latency of the previous packet of the same flow| (IPDV, RFC 3393)
+	uint64_t ipdv_n;
+	uint32_t last[MG_FLOWS_MAX]; // latency of the previous packet per flow, bit 31 set = valid
+	uint64_t h[MG_LAT_BUCKETS];
+};
+
+// Histogram bucket of a latency v (0 <= v < 2^31), see struct mg_lat.
+static inline uint32_t mg_lat_bucket(uint32_t v) {
+	// small values: one bucket each
+	if (v < (1u << MG_LAT_SUB)) {
+		return v;
+	}
+	// above: the top MG_LAT_SUB + 1 bits of v, i.e. 2^MG_LAT_SUB buckets per power of two
+	uint32_t shift = 31 - __builtin_clz(v) - MG_LAT_SUB;
+	return ((shift + 1) << MG_LAT_SUB) + (v >> shift) - (1u << MG_LAT_SUB);
+}
+
 // The crypto device of mg_ipsec_init (-1 before) and the pool of the crypto sessions of all SAs.
 static int mg_cdev_id = -1;
 static struct rte_mempool* mg_sess_pool;
 
 // Check the payload of n packets whose IPv4 header starts at l3_off: count them per flow and find gaps.
 // Fast path for IPv4 without options carrying UDP, which all generated packets are; anything else takes the
-// general path or is counted as other.
-static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n, uint16_t l3_off) {
+// general path or is counted as other. With lat (not NULL) also the latency against the receive time now (low 32
+// bits of the TSC).
+static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n, uint16_t l3_off,
+		struct mg_lat* lat, uint32_t now) {
 	const uint32_t fast_len = l3_off + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(struct mg_payload);
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf* m = mb[i];
@@ -133,17 +169,63 @@ static void mg_flows_check(struct mg_flows* fl, struct rte_mbuf** mb, uint16_t n
 			// sequence number from the past: reordered or duplicated; it was counted as missing before
 			f->late++;
 		}
+		// latency: difference of the low 32 bits of the TSC, signed, so that a wrap in between does not matter
+		if (lat) {
+			// no send time: the sender runs without --latency or is in its ramp
+			if (unlikely(p->time == 0)) {
+				lat->untimed++;
+				continue;
+			}
+			// negative: the sender does not share the TSC of this node
+			int32_t d = (int32_t) (now - p->time);
+			if (unlikely(d < 0)) {
+				lat->neg++;
+				continue;
+			}
+			// into the histogram, the sum and the maximum
+			lat->h[mg_lat_bucket(d)]++;
+			lat->n++;
+			lat->sum += d;
+			if (unlikely((uint64_t) d > lat->max)) lat->max = d;
+			// IPDV: against the previous packet of the flow on this queue, if it had a latency (bit 31)
+			uint32_t prev = lat->last[id];
+			if (prev & 0x80000000u) {
+				int32_t dd = d - (int32_t) (prev & 0x7fffffffu);
+				lat->ipdv_sum += dd < 0 ? -dd : dd;
+				lat->ipdv_n++;
+			}
+			lat->last[id] = (uint32_t) d | 0x80000000u;
+		}
 	}
 }
 
-// Complete receive step of the cleartext receiver: rx burst, check the payload, free.
+// Write the send times of n packets built from a packet template (payload at MG_PAYLOAD_OFF) for --latency: packet i
+// gets the low 32 bits of t0 + step * (i - i % group), with t0 and step in TSC ticks, step with 16 fractional bits,
+// but at least t_min. With NIC pacing t0 is the time in the schedule of the first packet and step the spacing the NIC
+// keeps; the packets of a pacing group follow its first one back to back and get its time. t_min is the time at which
+// the burst is filled: a sender behind its schedule (a stall of its core, caught up afterwards) hands over packets
+// whose time has passed, which the NIC sends at once, so that the delay of the sender does not count as latency.
+// Without pacing t0 = t_min and step is 0.
+void mg_payload_times(struct rte_mbuf** mb, uint16_t n, uint32_t t0, uint64_t step, uint16_t group, uint32_t t_min) {
+	// k = first packet of the pacing group of packet i; times before t_min (signed difference, wraps) become t_min
+	for (uint16_t i = 0; i < n; i++) {
+		uint32_t k = i - i % group;
+		uint32_t t = t0 + (uint32_t) ((k * step) >> 16);
+		if (unlikely((int32_t) (t - t_min) < 0)) t = t_min;
+		rte_pktmbuf_mtod_offset(mb[i], struct mg_payload*, MG_PAYLOAD_OFF)->time = t;
+	}
+}
+
+// Complete receive step of the cleartext receiver: rx burst, check the payload (and with lat the latency), free.
 // Returns the number of received packets.
-uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl) {
+uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl,
+		struct mg_lat* lat) {
 	uint16_t n = rte_eth_rx_burst(port, queue, mb, burst);
 	if (n == 0) {
 		return 0;
 	}
-	mg_flows_check(fl, mb, n, MG_IPSEC_ETH_LEN);
+	// with --latency the receive time (low 32 bits of the TSC) right after the rx burst
+	mg_flows_check(fl, mb, n, MG_IPSEC_ETH_LEN, lat, lat ? (uint32_t) rte_rdtsc() : 0);
 	rte_pktmbuf_free_bulk(mb, n);
 	return n;
 }
@@ -333,10 +415,12 @@ void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s) {
 // If tmpl is not NULL, it is copied into every mbuf first (the previous content was overwritten
 // by the last in-place encryption of that mbuf, so pre-filled mempools do not survive). If seq is not NULL
 // either, the template holds the generator payload (struct mg_payload) and every packet gets the next
-// sequence number of the flow from *seq.
+// sequence number of the flow from *seq. With group > 0 (--latency) the packets get their send times before the
+// encryption, see mg_payload_times; the payload must be in place then (template, or mg_fill_mix before).
 // Successfully encrypted packets are at mb[0..ret-1] and ready to send, failed ones are freed.
 uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
-		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails) {
+		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails,
+		uint32_t t0, uint64_t step, uint16_t group, uint32_t t_min) {
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf* m = mb[i];
 		// re-filled from the template: the whole buffer, starting after the headroom
@@ -360,6 +444,10 @@ uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uin
 			rte_pktmbuf_mtod_offset(mb[i], struct mg_payload*, MG_PAYLOAD_OFF)->seq = q++;
 		}
 		*seq = q;
+	}
+	// send times, inside the payload that is encrypted next
+	if (group) {
+		mg_payload_times(mb, n, t0, step, group, t_min);
 	}
 	// prepare gives every packet of the burst the next sequence number, also those that fail later
 	uint16_t k = rte_ipsec_pkt_cpu_prepare(&s->ss, mb, n);
@@ -424,10 +512,11 @@ uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint
 // removes the outer headers, 14 in transport mode, where it keeps the Ethernet header), free.
 // With spi_base = 0 the SPIs are arbitrary (e.g. negotiated by IKE): sas is then a hash table with nb_sa slots
 // (a power of two, at least one slot empty), indexed by the low bits of the SPI with linear probing.
+// With lat (and fl) also the latency, against the time of the rx burst, i.e. without the own decryption.
 // Returns the number of received packets.
 uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
 		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st, struct mg_flows* fl,
-		uint16_t l3_off) {
+		uint16_t l3_off, struct mg_lat* lat) {
 	// the arrays below hold at most MG_IPSEC_MAX_BURST packets
 	if (burst > MG_IPSEC_MAX_BURST) {
 		burst = MG_IPSEC_MAX_BURST;
@@ -436,6 +525,8 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 	if (n == 0) {
 		return 0;
 	}
+	// receive time for --latency (low 32 bits of the TSC), before the own decryption
+	uint32_t now = lat ? (uint32_t) rte_rdtsc() : 0;
 	// esp, idx: the ESP packets of the burst and the index of their SA; grp: the packets of one SA
 	struct rte_mbuf* esp[MG_IPSEC_MAX_BURST];
 	struct rte_mbuf* grp[MG_IPSEC_MAX_BURST];
@@ -519,7 +610,7 @@ uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb
 	// the payload check runs in a pass of its own over the whole burst: inside the loop above, its mere call slows
 	// that loop down by several percent; packets that were not decrypted have no valid payload there and count as other
 	if (fl) {
-		mg_flows_check(fl, mb, n, l3_off);
+		mg_flows_check(fl, mb, n, l3_off, lat, now);
 	}
 	rte_pktmbuf_free_bulk(mb, n);
 	return n;

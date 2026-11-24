@@ -4,7 +4,8 @@
 --- With --tx-sas n the n SAs are dealt out to the cores in turn (SA i to core i mod cores), and every core uses its
 --- SAs in turn, one burst each. With --sa-file the SAs of the file are dealt out in the same way.
 --- The inner UDP payload is the generator payload of ipsec-sw.lua (flow i = SA i, sequence number per flow), so
---- that plain-sink.lua can check the traffic after a device in between has decrypted it.
+--- that plain-sink.lua can check the traffic after a device in between has decrypted it. With --latency every packet
+--- carries its send time there, for the latency measurement of a receiver on the same node (see ipsec-sw.lua).
 --- ./build/MoonGen examples/ipsec/ipsec-gen.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <txDev> -c 4 -s 60
 local mg     = require "moongen"
 local memory = require "memory"
@@ -39,6 +40,7 @@ function configure(parser)
 	parser:option("--ramp-stagger", "Milliseconds by which each transmit core changes from the ramp to the fixed schedule later than the previous one, so that the cores do not all change at the same instant."):default(50):convert(tonumber)
 	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
+	parser:flag("--latency", "Write the send time into the payload, for the latency measurement of a receiver on the same node (see ipsec-sw.lua).")
 end
 
 --- Configures the port and the crypto device, starts one transmit task per core, shows the TX rate of the port until
@@ -208,6 +210,8 @@ function txSlave(queue, core, args)
 	local pacer = (args.nic_pacing or 0) > 0 and interval > 0 and ipsec.newPacer(args.ptp, args.nic_pacing * 1e-6, args.pacing_group)
 	local lead = pacer and pacer.lead or 0
 	local nextSend = start
+	-- --latency: the send times of the current burst (ipsec.sendTimes), none during the ramp
+	local times = args.latency and { 0, 0, 1, 0 }
 	-- one burst per pass until the end of the run
 	while mg.running() do
 		-- busy wait until the burst is due; due = its time in the schedule
@@ -245,14 +249,24 @@ function txSlave(queue, core, args)
 			sa, tmpl, seq = sas[cur], tmpls[cur], seqs[cur]
 		end
 		bufs:alloc(allocSize)
+		-- --latency at the full rate: with pacing the times at which the NIC sends the packets, from due on spaced like
+		-- pacer:stamp below; without pacing the current time for the whole burst
+		local t = nil
+		if times and not ramping then
+			if pacer then
+				t = ipsec.sendTimes(times, due, (nextSend - due) / bufs.size, pacer.group)
+			else
+				t = ipsec.sendTimes(times, mg.getTime(), 0)
+			end
+		end
 		-- fill and encrypt: a size mix is copied from its templates first, a single size is filled by ipsec.encrypt
-		-- itself from the template, together with the sequence numbers
+		-- itself from the template, together with the sequence numbers and the send times
 		local n
 		if mix then
 			ipsec.fillMix(bufs, bufs.size, tmpl, pos, seq)
-			n = ipsec.encrypt(sa, bufs, bufs.size, nil, 0, fails, nil)
+			n = ipsec.encrypt(sa, bufs, bufs.size, nil, 0, fails, nil, t)
 		else
-			n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, size, fails, seq)
+			n = ipsec.encrypt(sa, bufs, bufs.size, tmpl, size, fails, seq, t)
 		end
 		-- send the n packets that were encrypted (ipsec.encrypt has freed the others)
 		if n > 0 then

@@ -6,6 +6,8 @@
 --- rule per SA steers it to RX queue i mod rxCores (with --rss: RSS hash of the outer IPs instead).
 --- Only the receive offloads are switched off (ipsec-sink.lua switches off all of them): the NIC has to compute the
 --- outer IPv4 checksum of the frames sent.
+--- --latency: send times in the payload and latency of the packets received, if the peer runs on the same node (the
+--- two instances on the ports of avax, with the appliance in between), see ipsec-sw.lua.
 --- Node A: ./build/MoonGen examples/ipsec/ipsec-transceiver.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <dev> --tx-cores 4 --rx-cores 4
 --- Node B: the same with --tunnel-local 192.168.1.1 --tunnel-remote 192.168.0.1
 --- It also works against ipsec-gen.lua and ipsec-sink.lua with their default addresses on node A.
@@ -51,6 +53,7 @@ function configure(parser)
 	parser:option("--rx-linger", "Seconds to keep receiving after the own senders have stopped, to collect what the peer still sends."):default(2):convert(tonumber)
 	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(4):convert(tonumber)
+	parser:flag("--latency", "Write the send time into the payload and measure the latency of the packets received; the peer runs on the same node with --latency (see ipsec-sw.lua).")
 end
 
 --- Configures the port, the crypto device and the flow rules, starts the receive and then the transmit tasks, shows

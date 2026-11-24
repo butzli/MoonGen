@@ -5,6 +5,8 @@
 --- Every core decrypts, authenticates and counts the packets of its queue and checks the generator payload of the
 --- decrypted packets (ipsec-sw.lua): per flow, gaps and reordering end to end, also of traffic that a device in
 --- between has encrypted itself (whose ESP sequence numbers then only cover the way from the device to here).
+--- With --latency also the latency from the send times in the payload (sender with --latency on the same node, see
+--- ipsec-sw.lua).
 --- ./build/MoonGen examples/ipsec/ipsec-sink.lua --dpdk-config=examples/ipsec/dpdk-conf.lua <rxDev> -c 4 --sas 4
 local mg     = require "moongen"
 local memory = require "memory"
@@ -37,6 +39,7 @@ function configure(parser)
 	parser:flag("--offloads", "Keep libmoon's default receive offloads (checksum verification, VLAN, timestamps) instead of switching them off.")
 	parser:flag("--rss", "Distribute the SAs by RSS hash of the outer IPs instead of one rte_flow rule per SPI.")
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:flag("--latency", "Measure the latency from the send times in the payload (sender with --latency on the same node, see ipsec-sw.lua).")
 end
 
 --- Configures the port, the crypto device and the flow rules, starts one receive task per core, shows the RX rate of
@@ -76,26 +79,31 @@ end
 
 --- Waits for the receive tasks and prints their results (also used by ipsec-transceiver.lua).
 function rxSummary(tasks, args, rxDev)
-	local total, flows, seqs = {0, 0, 0, 0, 0, 0, 0}, {}, {}
-	-- per queue: its counters added to the total, its flows and the "in SPI LAST" lines of its SAs collected, and its
-	-- longest stall
+	local total, flows, seqs, lats = {0, 0, 0, 0, 0, 0, 0}, {}, {}, {}
+	-- per queue: its counters added to the total, its flows, the "in SPI LAST" lines of its SAs and its latencies
+	-- collected, and its longest stall
 	for i = 0, args.cores - 1 do
-		local res, gap, gapAt, fl, lasts = tasks[i]:wait()
+		local res, gap, gapAt, fl, lasts, lat = tasks[i]:wait()
 		seqs[#seqs + 1] = lasts
 		for k, v in ipairs(res) do
 			total[k] = total[k] + v
 		end
-		flows[i] = fl
+		flows[i], lats[i] = fl, lat
 		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", i, gap * 1e3, gapAt)
 	end
 	log:info("Total: " .. SUMMARY .. ", missing in between %d", unpack(total))
 	-- per flow of the generator payload, over all queues
 	ipsec.flowSummary(flows, args.cores, "Payload: ")
+	-- --latency: over all queues
+	if args.latency then ipsec.latencySummary(lats, args.cores, "") end
 	if args.seq_file then ipsec.saveSeqFile(args.seq_file, table.concat(seqs)) end
 	-- counters of the port: imissed = dropped because the RX queue was full
 	local nic = rxDev:getStats()
 	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
+	-- written out now: redirected into a file, stdout is buffered, and DPDK writes to stderr at the exit of the process,
+	-- which otherwise lands in the middle of a line of these results (the pos-scripts read them from the log)
+	io.stdout:flush()
 end
 
 --- SA number i: the entry of the SA file or, without one, the SA derived from the options.
@@ -111,7 +119,7 @@ end
 
 --- Receive task of one core: receives, decrypts and checks the packets of its queue until the end of the run (plus
 --- rx_linger). Returns the counters in the order of FIELDS plus the packets missing between the sequence numbers, the
---- longest stall, the flow results and the "in SPI LAST" lines of its SAs.
+--- longest stall, the flow results, the "in SPI LAST" lines of its SAs and with --latency the latency results.
 function rxSlave(queue, core, args)
 	-- own inbound SA instances for all SPIs; only those arriving on this queue are ever used
 	local sas, spis = {}, {}
@@ -139,6 +147,8 @@ function rxSlave(queue, core, args)
 	end
 	local st = ipsec.newRxStats()
 	local flows = ipsec.newFlows()
+	-- --latency: histogram of the latencies of this queue
+	local lat = args.latency and ipsec.newLatency() or nil
 	local bufs = memory.bufArray(args.burst)
 	-- no output inside this loop: printing statistics here stalls it long enough for the RX queue to overflow
 	-- ipsec-transceiver.lua keeps receiving for rx_linger seconds after its own senders have stopped
@@ -149,7 +159,7 @@ function rxSlave(queue, core, args)
 	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
 	-- one burst per pass: receive, decrypt, count, check, free
 	while mg.running(linger) do
-		ipsec.rxDecrypt(queue, bufs, saTable, numSas, spiBase, st, flows, args.mode)
+		ipsec.rxDecrypt(queue, bufs, saTable, numSas, spiBase, st, flows, args.mode, lat)
 		local now = mg.getTime()
 		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
 		last = now
@@ -174,5 +184,5 @@ function rxSlave(queue, core, args)
 		end
 	end
 	res[#FIELDS + 1] = missing
-	return res, maxGap, maxGapAt, ipsec.flowResults(flows), ipsec.lastSeqs(sas, spis)
+	return res, maxGap, maxGapAt, ipsec.flowResults(flows), ipsec.lastSeqs(sas, spis), lat and ipsec.latencyResults(lat)
 end

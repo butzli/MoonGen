@@ -4,8 +4,9 @@
 --- Reports per flow which queue(s) it arrived on and whether its sequence numbers are complete and in order.
 --- Checks the generator payload of ipsec-sw.lua, so it also checks the traffic of ipsec-gen.lua after a device in
 --- between has decrypted it (then --src is the inner source address of the first SA, 10.0.0.1 by default).
---- Packets without that payload are counted per queue as other packets. The receive tasks are also used by
---- plain-transceiver.lua.
+--- Packets without that payload are counted per queue as other packets. With --latency it also measures the latency
+--- from the send times in the payload (sender with --latency on the same node, see ipsec-sw.lua). The receive tasks
+--- are also used by plain-transceiver.lua.
 --- ./build/MoonGen examples/ipsec/plain-sink.lua <rxDev> -c 4 -n 4 -t 25
 local mg     = require "moongen"
 local memory = require "memory"
@@ -27,6 +28,7 @@ function configure(parser)
 	parser:option("--rx-descs", "Size of each RX ring."):default(4096):convert(tonumber)
 	parser:flag("--offloads", "Keep libmoon's default receive offloads (checksum verification, VLAN, timestamps) instead of switching them off.")
 	parser:option("-t --time", "Run time in seconds, 0 = until Ctrl+C."):default(0):convert(tonumber)
+	parser:flag("--latency", "Measure the latency from the send times in the payload (sender with --latency on the same node, see ipsec-sw.lua).")
 end
 
 --- Configures the port and the flow rules, starts one receive task per core, shows the RX rate of the port until the
@@ -58,28 +60,35 @@ end
 
 --- Waits for the receive tasks and prints their results (also used by plain-transceiver.lua).
 function rxSummary(tasks, args, rxDev)
-	local flows = {}
-	-- per queue: its flows collected, its longest stall and its other packets
+	local flows, lats = {}, {}
+	-- per queue: its flows and its latencies collected, its longest stall and its other packets
 	for q = 0, args.cores - 1 do
-		local res, gap, gapAt = tasks[q]:wait()
-		flows[q] = res
+		local res, gap, gapAt, lat = tasks[q]:wait()
+		flows[q], lats[q] = res, lat
 		log:info("Queue %d: longest pause between two receive calls %.3f ms at %.2f s", q, gap * 1e3, gapAt)
 		-- with one flow rule per source address and no more flows than queues, this is the count of one flow
 		log:info("Queue %d: other packets %d", q, res.other)
 	end
 	-- per flow over all queues
 	ipsec.flowSummary(flows, args.cores, "")
+	-- --latency: over all queues
+	if args.latency then ipsec.latencySummary(lats, args.cores, "") end
 	-- counters of the port: imissed = dropped because the RX queue was full
 	local nic = rxDev:getStats()
 	log:info("NIC: delivered to the queues %d, dropped because a queue was full %d, errors %d, no buffers %d",
 		tonumber(nic.ipackets), tonumber(nic.imissed), tonumber(nic.ierrors), tonumber(nic.rx_nombuf))
+	-- written out now: redirected into a file, stdout is buffered, and DPDK writes to stderr at the exit of the process,
+	-- which otherwise lands in the middle of a line of these results (the pos-scripts read them from the log)
+	io.stdout:flush()
 end
 
 --- Receive task of one core: receives and checks the packets of its queue until the end of the run (plus rx_linger).
---- Returns the flow results and the longest stall.
+--- Returns the flow results, the longest stall and with --latency the latency results.
 function rxSlave(queue, core, args)
 	local bufs = memory.bufArray(args.burst)
 	local flows = ipsec.newFlows()
+	-- --latency: histogram of the latencies of this queue
+	local lat = args.latency and ipsec.newLatency() or nil
 	-- plain-transceiver.lua keeps receiving for rx_linger seconds after its own senders have stopped
 	local linger = (args.rx_linger or 0) * 1000
 	-- diagnosis: longest time between two receive calls, i.e. the longest stall of this task; the time given is
@@ -88,10 +97,10 @@ function rxSlave(queue, core, args)
 	local ref, maxGap, maxGapAt = args.txStart or last + 1, 0, 0
 	-- one burst per pass: receive, check, free
 	while mg.running(linger) do
-		ipsec.plainRx(queue, bufs, flows)
+		ipsec.plainRx(queue, bufs, flows, lat)
 		local now = mg.getTime()
 		if now - last > maxGap and now > ref then maxGap, maxGapAt = now - last, now - ref end
 		last = now
 	end
-	return ipsec.flowResults(flows), maxGap, maxGapAt
+	return ipsec.flowResults(flows), maxGap, maxGapAt, lat and ipsec.latencyResults(lat)
 end

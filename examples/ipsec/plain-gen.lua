@@ -6,7 +6,8 @@
 --- instead, e.g. to the inner addresses of the peers of a device in between (address plan in pos-scripts/ike).
 --- The UDP payload is the generator payload of ipsec-sw.lua (magic, flow, sequence number per flow), the same as the
 --- inner payload of ipsec-gen.lua, so that ipsec-sink.lua can check this traffic after a device in between has
---- encrypted it.
+--- encrypted it. With --latency every packet carries its send time there, for the latency measurement of a receiver
+--- on the same node (see ipsec-sw.lua).
 --- The transmit tasks are also used by plain-transceiver.lua.
 --- ./build/MoonGen examples/ipsec/plain-gen.lua <txDev> -c 4 -s 60 -t 10
 local mg     = require "moongen"
@@ -36,6 +37,7 @@ function configure(parser)
 	parser:option("--ramp-stagger", "Milliseconds by which each transmit core changes from the ramp to the fixed schedule later than the previous one, so that the cores do not all change at the same instant."):default(50):convert(tonumber)
 	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(1):convert(tonumber)
+	parser:flag("--latency", "Write the send time into the payload, for the latency measurement of a receiver on the same node (see ipsec-sw.lua).")
 end
 
 --- Configures the port, starts one transmit task per core, shows the TX rate of the port until the end of the run and
@@ -158,6 +160,8 @@ function txSlave(queue, core, args)
 	local pacer = (args.nic_pacing or 0) > 0 and interval > 0 and ipsec.newPacer(args.ptp, args.nic_pacing * 1e-6, args.pacing_group)
 	local lead = pacer and pacer.lead or 0
 	local nextSend = start
+	-- --latency: the send times of the current burst (ipsec.sendTimes), none during the ramp
+	local times = args.latency and { 0, 0, 1, 0 }
 	-- one burst per pass until the end of the run
 	while mg.running() do
 		-- busy wait until the burst is due; due = its time in the schedule
@@ -201,6 +205,16 @@ function txSlave(queue, core, args)
 				ipsec.setPayloadSeq(buf:getUdpPacket(), seq)
 				seq = seq + 1
 			end
+		end
+		-- --latency at the full rate: with pacing the times at which the NIC sends the packets, from due on spaced like
+		-- pacer:stamp below; without pacing the current time for the whole burst
+		if times and not ramping then
+			if pacer then
+				ipsec.sendTimes(times, due, (nextSend - due) / bufs.size, pacer.group)
+			else
+				ipsec.sendTimes(times, mg.getTime(), 0)
+			end
+			ipsec.stampTimes(bufs, bufs.size, times)
 		end
 		-- --nic-pacing: send times spaced evenly from due up to the next burst
 		if pacer then pacer:stamp(bufs, bufs.size, due, (nextSend - due) / bufs.size) end

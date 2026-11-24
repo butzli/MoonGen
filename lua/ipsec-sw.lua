@@ -4,7 +4,7 @@
 --- Requires the crypto vdev in the DPDK config, e.g. cli = { "--vdev=crypto_aesni_gcm0" },
 --- and DPDK built with libipsec-mb-dev installed.
 --- Also holds what the cleartext programs (plain-*.lua) share with the IPsec ones: the generator payload and its
---- check per flow, the NIC steering by rte_flow and the NIC pacing.
+--- check per flow, the latency measurement, the NIC steering by rte_flow and the NIC pacing.
 ---------------------------------
 
 local ffi = require "ffi"
@@ -35,7 +35,9 @@ ffi.cdef[[
 	void mg_ipsec_sa_destroy(struct mg_ipsec_sa* s);
 	uint64_t mg_ipsec_sa_rx_range(const struct mg_ipsec_sa* s, uint64_t* first, uint64_t* last);
 	uint16_t mg_ipsec_encrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n,
-		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails);
+		const uint8_t* tmpl, uint16_t tmpl_len, uint64_t* seq, uint64_t* fails,
+		uint32_t t0, uint64_t step, uint16_t group, uint32_t t_min);
+	void mg_payload_times(struct rte_mbuf** mb, uint16_t n, uint32_t t0, uint64_t step, uint16_t group, uint32_t t_min);
 	void mg_fill_mix(struct rte_mbuf** mb, uint16_t n, const uint8_t* const* tmpls, const uint16_t* lens, uint16_t plen,
 		uint16_t* pos, uint64_t* seq);
 	uint16_t mg_ipsec_decrypt_burst(struct mg_ipsec_sa* s, struct rte_mbuf** mb, uint16_t n, uint16_t* prep_ok);
@@ -51,10 +53,23 @@ ffi.cdef[[
 		struct mg_flow f[4096]; // = MG_FLOWS_MAX in src/ipsec-sw.c, both must be the same
 	};
 
+	struct mg_lat {
+		uint64_t n;
+		uint64_t sum;
+		uint64_t max;
+		uint64_t untimed;
+		uint64_t neg;
+		uint64_t ipdv_sum;
+		uint64_t ipdv_n;
+		uint32_t last[4096];  // = MG_FLOWS_MAX
+		uint64_t h[22528];    // = MG_LAT_BUCKETS = (32 - MG_LAT_SUB) << MG_LAT_SUB with MG_LAT_SUB = 10
+	};
+
 	uint16_t mg_ipsec_rx_decrypt(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst,
 		struct mg_ipsec_sa** sas, uint32_t nb_sa, uint32_t spi_base, struct mg_ipsec_rx_stats* st, struct mg_flows* fl,
-		uint16_t l3_off);
-	uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl);
+		uint16_t l3_off, struct mg_lat* lat);
+	uint16_t mg_plain_rx(uint16_t port, uint16_t queue, struct rte_mbuf** mb, uint16_t burst, struct mg_flows* fl,
+		struct mg_lat* lat);
 ]]
 
 local mod = {}
@@ -155,15 +170,20 @@ end
 --- Encrypt bufs[0..n-1] in place, optionally re-filling them from a packet template first.
 --- @param seq optional uint64_t[1]: the template holds the generator payload (mod.fillPayload) and every packet
 ---   gets the next sequence number from seq[0]
+--- @param times optional send times (mod.sendTimes), written into the payload before the encryption
 --- @return number of encrypted packets at the start of bufs.array (failed ones are freed)
-function mod.encrypt(sa, bufs, n, tmpl, tmplLen, fails, seq)
-	return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, seq, fails)
+function mod.encrypt(sa, bufs, n, tmpl, tmplLen, fails, seq, times)
+	if times then
+		return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, seq, fails, times[1], times[2], times[3],
+			times[4])
+	end
+	return C.mg_ipsec_encrypt_burst(sa, bufs.array, n, tmpl, tmplLen or 0, seq, fails, 0, 0, 0, 0)
 end
 
 --- Payload of the generated packets, the UDP payload of the (inner) packet with and without ESP, so that
 --- either receiver checks the traffic of either generator, also after a device in between has en- or decrypted it:
---- magic (uint32) | send time (uint32, reserved, 0) | sequence number of the flow (uint64) | flow (uint16)
---- = 18 bytes, which fills a 60 byte frame (see struct mg_payload in src/ipsec-sw.c).
+--- magic (uint32) | send time (uint32, 0 = none, see mod.sendTimes) | sequence number of the flow (uint64) |
+--- flow (uint16) = 18 bytes, which fills a 60 byte frame (see struct mg_payload in src/ipsec-sw.c).
 -- magic = "PLAI"
 mod.PAYLOAD_MAGIC = 0x504c4149
 mod.MIN_FRAME = 60
@@ -471,15 +491,123 @@ end
 -- length of the Ethernet header, offset of the inner IPv4 header in transport mode
 local ETH_HDR_LEN = 14
 --- Receive, decrypt, count and free one burst; with flows (mod.newFlows) also check the payload of the decrypted
---- packets, whose inner IPv4 header starts at offset 0 in tunnel mode and after the Ethernet header in transport mode.
-function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats, flows, mode)
+--- packets, whose inner IPv4 header starts at offset 0 in tunnel mode and after the Ethernet header in transport mode;
+--- with lat (mod.newLatency) also their latency.
+function mod.rxDecrypt(rxQueue, bufs, saTable, numSas, spiBase, stats, flows, mode, lat)
 	return C.mg_ipsec_rx_decrypt(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, saTable, numSas, spiBase, stats, flows,
-		mode == "transport" and ETH_HDR_LEN or 0)
+		mode == "transport" and ETH_HDR_LEN or 0, lat)
 end
 
---- Receive one burst of cleartext packets, check their payload into flows (mod.newFlows) and free them.
-function mod.plainRx(rxQueue, bufs, flows)
-	return C.mg_plain_rx(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, flows)
+--- Receive one burst of cleartext packets, check their payload into flows (mod.newFlows), with lat (mod.newLatency)
+--- also their latency, and free them.
+function mod.plainRx(rxQueue, bufs, flows, lat)
+	return C.mg_plain_rx(rxQueue.id, rxQueue.qid, bufs.array, bufs.size, flows, lat)
+end
+
+-- Latency (--latency of the generators, receivers and transceivers): the sender writes the time at which a packet
+-- leaves into the send time field of its payload, as the low 32 bits of the TSC (see struct mg_payload in
+-- src/ipsec-sw.c for why TSC ticks); the receiver subtracts it from the TSC at its rx burst and counts the result per
+-- queue in a histogram (struct mg_lat). Only meaningful if sender and receiver share the TSC, i.e. run on one node.
+-- With NIC pacing the time is the one in the schedule at which the NIC sends the packet, or the time at which the
+-- burst is filled if the sender is behind its schedule (then the NIC sends at once); the pacer maps the schedule to
+-- the NIC clock (pacer:calibrate), so the error of that mapping is in the result, and a burst whose encryption takes
+-- longer than the lead leaves late, which shows up as latency. Without pacing it is the time at which the burst is
+-- filled, before its encryption. The sender writes no times during its ramp (time 0), so that only the full rate is
+-- measured.
+
+-- TSC ticks per second of this process, and libmoon for the TSC time
+local tscHz
+local libmoon = require "libmoon"
+
+--- Send times of a burst for mod.encrypt and mod.stampTimes, written into times = { t0, step, group, tMin } (one table
+--- per task, reused for every burst): due = time (mg.getTime) of its first packet in the schedule, spacing = seconds
+--- between its packets (0 without pacing), group = pacing group; no packet gets a time before now (mg.getTime), see
+--- mg_payload_times in src/ipsec-sw.c. Returns times.
+function mod.sendTimes(times, due, spacing, group)
+	tscHz = tscHz or libmoon.getCyclesFrequency()
+	-- low 32 bits of the TSC at due and now, and the spacing in ticks with 16 fractional bits; the products stay below
+	-- 2^53
+	times[1], times[2], times[3] = due * tscHz % 2^32, spacing * tscHz * 65536, group or 1
+	times[4] = libmoon.getTime() * tscHz % 2^32
+	return times
+end
+
+--- Write send times (mod.sendTimes) into the payload of bufs[0..n-1], for packets that are not encrypted.
+function mod.stampTimes(bufs, n, times)
+	C.mg_payload_times(bufs.array, n, times[1], times[2], times[3], times[4])
+end
+
+--- Latency histogram of one receive queue for mod.rxDecrypt and mod.plainRx.
+function mod.newLatency()
+	return ffi.new("struct mg_lat")
+end
+
+--- The latency counters of one receive queue as a plain table (to be returned by a task), the histogram only with
+--- its buckets that are not empty.
+--- @return { n, sum, max, untimed, neg, ipdvSum, ipdvN, h = { [bucket] = count } }
+function mod.latencyResults(lat)
+	local res = { n = tonumber(lat.n), sum = tonumber(lat.sum), max = tonumber(lat.max),
+		untimed = tonumber(lat.untimed), neg = tonumber(lat.neg), ipdvSum = tonumber(lat.ipdv_sum),
+		ipdvN = tonumber(lat.ipdv_n), h = {} }
+	-- only the buckets that are not empty (22528 = size of h in the declaration above)
+	for i = 0, 22528 - 1 do
+		if lat.h[i] > 0 then res.h[i] = tonumber(lat.h[i]) end
+	end
+	return res
+end
+
+-- histogram buckets per power of two = 2^MG_LAT_SUB in src/ipsec-sw.c
+local LAT_SUB = 1024
+-- middle of histogram bucket i in TSC ticks: below LAT_SUB one tick per bucket, above LAT_SUB buckets per power of two
+local function bucketMid(i)
+	if i < LAT_SUB then return i end
+	-- bucket i covers (LAT_SUB + i % LAT_SUB) * 2^shift up to the next bucket
+	local shift = math.floor(i / LAT_SUB) - 1
+	return (LAT_SUB + i % LAT_SUB) * 2^shift + (2^shift - 1) / 2
+end
+
+--- Merge and print the latency of all receive queues (res[q] = mod.latencyResults of queue q): one line
+--- "<prefix>Latency: n=... min=... p1=... p50=... p90=... p99=... p999=... max=... mean=... ipdv=... untimed=...
+--- neg=... (us)" with the times in microseconds (percentiles at the middle of their histogram bucket, resolution
+--- 0.1 %), n = packets with a send time, ipdv = mean |difference| of consecutive packets of a flow (RFC 3393).
+--- @return the line without the prefix, nil if no packet had a send time
+function mod.latencySummary(res, queues, prefix)
+	tscHz = tscHz or libmoon.getCyclesFrequency()
+	-- the counters and the histograms of all queues added up
+	local t, h = { n = 0, sum = 0, max = 0, untimed = 0, neg = 0, ipdvSum = 0, ipdvN = 0 }, {}
+	for q = 0, queues - 1 do
+		local r = res[q]
+		for _, k in ipairs({ "n", "sum", "untimed", "neg", "ipdvSum", "ipdvN" }) do
+			t[k] = t[k] + r[k]
+		end
+		t.max = math.max(t.max, r.max)
+		for i, c in pairs(r.h) do
+			h[i] = (h[i] or 0) + c
+		end
+	end
+	-- no packet with a send time: the sender ran without --latency
+	if t.n == 0 then
+		log:info("%sLatency: no packets with a send time (untimed %d, negative %d)", prefix, t.untimed, t.neg)
+		return nil
+	end
+	-- the buckets in ascending order; for each percentile the first bucket at which the cumulated count reaches it
+	local idx = {}
+	for i in pairs(h) do idx[#idx + 1] = i end
+	table.sort(idx)
+	local us = function(ticks) return ticks / tscHz * 1e6 end
+	local qs, pct, k, cum = { 0.01, 0.5, 0.9, 0.99, 0.999 }, {}, 1, 0
+	for _, i in ipairs(idx) do
+		cum = cum + h[i]
+		-- this bucket may hold several percentiles
+		while k <= #qs and cum >= qs[k] * t.n do
+			pct[k], k = us(bucketMid(i)), k + 1
+		end
+	end
+	local line = ("Latency: n=%d min=%.3f p1=%.3f p50=%.3f p90=%.3f p99=%.3f p999=%.3f max=%.3f mean=%.3f ipdv=%.3f"
+		.. " untimed=%d neg=%d (us)"):format(t.n, us(bucketMid(idx[1])), pct[1], pct[2], pct[3], pct[4], pct[5],
+			us(t.max), us(t.sum / t.n), t.ipdvN > 0 and us(t.ipdvSum / t.ipdvN) or 0, t.untimed, t.neg)
+	log:info("%s%s", prefix, line)
+	return line
 end
 
 -- NIC pacing (--nic-pacing of the generators): the NIC sends every packet at the time it carries in its mbuf

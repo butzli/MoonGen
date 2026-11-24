@@ -7,7 +7,7 @@
 --- Receiving: one rte_flow rule per flow steers source address rxSrc + i to RX queue i mod rxCores (with --rss: RSS
 --- hash instead). Both sides carry the same generator payload (ipsec-sw.lua), so the receivers also check the
 --- traffic of ipsec-gen.lua after the device has decrypted it; packets without it are counted per queue as other.
---- Like ipsec-transceiver.lua, only the receive offloads are switched off.
+--- Like ipsec-transceiver.lua, only the receive offloads are switched off, and --latency works the same way.
 --- Node A: ./build/MoonGen examples/ipsec/plain-transceiver.lua <dev> --tx-cores 4 --rx-cores 4
 --- Node B: the same with --src 192.168.1.1 --dst 192.168.0.1 --rx-src 192.168.0.1
 --- It also works against plain-gen.lua and plain-sink.lua with their default addresses on node A.
@@ -48,6 +48,7 @@ function configure(parser)
 	parser:option("--rx-linger", "Seconds to keep receiving after the own senders have stopped, to collect what the peer still sends."):default(2):convert(tonumber)
 	parser:option("--nic-pacing", "With a rate limit: let the NIC send every packet at its time in the schedule, handing it over this many microseconds ahead (ipsec.newPacer); 0 = off."):default(20):convert(tonumber)
 	parser:option("--pacing-group", "With --nic-pacing: only every n-th packet carries a time, the ones in between follow it back to back."):default(1):convert(tonumber)
+	parser:flag("--latency", "Write the send time into the payload and measure the latency of the packets received; the peer runs on the same node with --latency (see ipsec-sw.lua).")
 end
 
 --- Configures the port and the flow rules, starts the receive and then the transmit tasks, shows the rates of the port
